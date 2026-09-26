@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test:p0": "tsx --test tests/p0-vdp-parser.test.ts tests/p0-vdp-extractor.test.ts tests/p0-probability-engine.test.ts tests/p0-api.test.ts"
   },
   "dependencies": {
     "next": "16.3.5",
