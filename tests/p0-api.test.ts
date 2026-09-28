@@ -9,6 +9,7 @@ import {
   buildResearchReportWithVdp,
   buildLlmContractResponse,
 } from './helpers/fixtures';
+import { clearResearchCacheForTests } from '../src/lib/data/research-cache';
 
 type FetchCall = { url: string; method: string };
 
@@ -60,6 +61,7 @@ describe('P0 API /api/analyze (current behavior)', () => {
 
   beforeEach(() => {
     calls = [];
+    clearResearchCacheForTests();
     // Изолируем от реального окружения: только тестовые ключи, никакого .env
     process.env.YDC_API_KEY = 'ydc_live_p0test';
     process.env.KEYDEALER_API_KEY = 'kd_live_p0test';

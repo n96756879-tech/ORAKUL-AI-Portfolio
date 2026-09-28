@@ -2,6 +2,37 @@ import { NextResponse } from 'next/server';
 import { parseVDP } from '@/lib/vdp-parser';
 import { calculateProbabilities } from '@/lib/probability-engine';
 import { extractVDP } from '@/lib/vdp-extractor';
+import {
+  assembleVdp,
+  createKeyDealerWebFetcher,
+  getSharedDataPackCache,
+  matchQueryFromFreeForm,
+  mergeEngineInput,
+  resolveDataPack,
+  buildResearchCacheKey,
+  getCachedResearch,
+  getOrRunResearch,
+} from '@/lib/data';
+import type { DataPack } from '@/lib/data';
+
+// Парсер ORAKUL_DAL_SOURCE_URLS: «normalized match key|URL», элементы через «;;».
+// Пример: football|belgium|vs|france|;;https://www.uefa.com/... (секреты не содержит).
+function parseDalSourceUrls(raw: string | undefined): { matchKey: string; url: string }[] {
+  if (!raw) return [];
+  return raw
+    .split(';;')
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0)
+    .map((part) => {
+      const sep = part.indexOf('|http');
+      if (sep < 0) return null;
+      const matchKey = part.slice(0, sep).trim();
+      const url = part.slice(sep + 1).trim();
+      if (!matchKey || !/^https?:\/\//i.test(url)) return null;
+      return { matchKey, url };
+    })
+    .filter((v): v is { matchKey: string; url: string } => v !== null);
+}
 
 const MAX_RESEARCH_CHARS = 50000;
 
@@ -464,6 +495,33 @@ export async function POST(req: Request) {
     }
 
     const currentDateStr = '2026 год';
+    const researchQuery = matchQueryFromFreeForm(trimmedMatch);
+    const researchCacheKey = buildResearchCacheKey(researchQuery);
+
+    // ── DAL (STEP 9/10): опциональный контекст данных, полностью bypass по умолчанию.
+    // Не влияет на You.com VDP pipeline; пустой DataPack не является ошибкой.
+    // STEP 10: KeyDealer /v1/web/fetch — ТОЛЬКО при явном URL из ORAKUL_DAL_SOURCE_URLS.
+    const dalEnabled = process.env.ORAKUL_DAL_ENABLED === 'true';
+    let dalContext: ReturnType<typeof assembleVdp> | null = null;
+    let dalDataPack: DataPack | null = null;
+    if (dalEnabled) {
+      const dalQuery = matchQueryFromFreeForm(trimmedMatch);
+      const sourceUrls = parseDalSourceUrls(process.env.ORAKUL_DAL_SOURCE_URLS);
+      const dalOutcome = await resolveDataPack(dalQuery, {
+        cache: getSharedDataPackCache(),
+        keyDealerWebFetcher: createKeyDealerWebFetcher(),
+        sourceUrls,
+      });
+      dalDataPack = dalOutcome.dataPack;
+      dalContext = assembleVdp(dalOutcome.dataPack);
+      console.log(
+        `[ORAKUL DAL] enabled=true cacheHit=${dalOutcome.cacheHit} status=${dalContext.stats.status} ` +
+          `confirmed=${dalContext.stats.confirmed} sources=${dalOutcome.dataPack.sources.length} ` +
+          `conflicts=${dalContext.conflicts.length} attempted=[${dalOutcome.attemptedSourceIds.join(',')}]`
+      );
+    } else {
+      console.log('[ORAKUL DAL] enabled=false bypass');
+    }
 
     // 1. Формирование исследовательского вопроса
     const researchQuestion = `Проведи глубокое независимое спортивно-статистическое исследование матча "${trimmedMatch}" (актуальный контекст: ${currentDateStr}).
@@ -826,7 +884,13 @@ CONFLICTS / UNCERTAINTIES
 * UNCONFIRMED: ...
 ...`;
 
-    // 2. Инициализация фонового исследования (background: true)
+    const cachedResearch = getCachedResearch(researchCacheKey);
+    let researchReportText = cachedResearch?.report ?? '';
+    let researchSources: ResearchSource[] = cachedResearch?.sources ?? [];
+
+    if (!cachedResearch) {
+      const researchResult = await getOrRunResearch(researchCacheKey, async () => {
+        // 2. Инициализация фонового исследования (background: true)
     let taskId: string | null = null;
     try {
       const initRes = await fetch('https://api.you.com/v1/research', {
@@ -847,10 +911,7 @@ CONFLICTS / UNCERTAINTIES
         const rawErrText = await initRes.text();
         const safeErrText = sanitizeSecrets(rawErrText);
         console.error(`You.com Research API init HTTP error: ${initRes.status}`, safeErrText);
-        return NextResponse.json(
-          { error: `You.com Research failed: HTTP ${initRes.status} — ${safeErrText}` },
-          { status: initRes.status }
-        );
+        throw new Error(`You.com Research failed: HTTP ${initRes.status} — ${safeErrText}`);
       }
 
       const initData = await initRes.json();
@@ -859,23 +920,17 @@ CONFLICTS / UNCERTAINTIES
       if (!taskId) {
         const safeFields = Object.keys(initData).join(', ');
         console.error('You.com Research API did not return task_id. Top fields:', safeFields);
-        return NextResponse.json(
-          { error: `You.com Research init failed: task_id was missing in response (available fields: ${safeFields})` },
-          { status: 500 }
-        );
+        throw new Error(`You.com Research init failed: task_id was missing in response (available fields: ${safeFields})`);
       }
     } catch (initErr: any) {
       const safeMsg = sanitizeSecrets(initErr?.message || String(initErr));
       console.error('You.com Research API init fetch error:', safeMsg);
-      return NextResponse.json(
-        { error: `You.com Research init connection failed: ${safeMsg}` },
-        { status: 503 }
-      );
+      throw new Error(`You.com Research init connection failed: ${safeMsg}`);
     }
 
     // 3. Polling результатов (опрос GET /v1/research/{task_id})
-    let researchReportText = '';
-    let researchSources: ResearchSource[] = [];
+    researchReportText = '';
+    researchSources = [];
     
     const pollingIntervalMs = 2500; // 2.5 секунды
     const maxTimeoutMs = 180000;    // 180 секунд timeout
@@ -948,16 +1003,10 @@ CONFLICTS / UNCERTAINTIES
             pollData.error || pollData.failure_reason || pollData.message || JSON.stringify(pollData)
           );
           console.error(`You.com Research task ${taskId} failed with status: ${status}. Error:`, taskErrMsg);
-          return NextResponse.json(
-            { error: `You.com Research task failed (status: ${status}, task_id: ${taskId}): ${taskErrMsg}` },
-            { status: 500 }
-          );
+            throw new Error(`You.com Research task failed (status: ${status}, task_id: ${taskId}): ${taskErrMsg}`);
         } else if (status === 'cancelled') {
           console.error(`You.com Research task ${taskId} was cancelled`);
-          return NextResponse.json(
-            { error: `You.com Research task cancelled (status: ${status}, task_id: ${taskId})` },
-            { status: 500 }
-          );
+            throw new Error(`You.com Research task cancelled (status: ${status}, task_id: ${taskId})`);
         }
 
         // Статусы 'queued', 'running', 'in_progress' — продолжаем опрос
@@ -971,10 +1020,7 @@ CONFLICTS / UNCERTAINTIES
 
     if (!isCompleted) {
       console.warn(`You.com Research polling timed out after ${maxTimeoutMs}ms for task ${taskId}. Last status: ${lastStatus}`);
-      return NextResponse.json(
-        { error: `You.com Research task timeout after 180s (last status: ${lastStatus}, task_id: ${taskId})` },
-        { status: 504 }
-      );
+      throw new Error(`You.com Research task timeout after 180s (last status: ${lastStatus}, task_id: ${taskId})`);
     }
 
     const normalizedResearchReport = normalizeResearchReport(researchReportText);
@@ -983,11 +1029,16 @@ CONFLICTS / UNCERTAINTIES
       const topFields = lastPollData ? Object.keys(lastPollData).join(', ') : 'none';
       const resultFields = lastPollData?.result ? Object.keys(lastPollData.result).join(', ') : 'none';
       console.warn('Research completed but normalized research report was empty. Available fields:', topFields, resultFields);
-      return NextResponse.json(
-        { error: `Research completed but research report content was missing or empty (available top fields: ${topFields}, result fields: ${resultFields})` },
-        { status: 503 }
-      );
+      throw new Error(`Research completed but research report content was missing or empty (available top fields: ${topFields}, result fields: ${resultFields})`);
     }
+
+        return { report: normalizedResearchReport, sources: researchSources };
+      });
+      researchReportText = researchResult.report;
+      researchSources = researchResult.sources;
+    }
+
+    const normalizedResearchReport = normalizeResearchReport(researchReportText);
 
     // 4. Системный промпт эксперта-аналитика ORAKUL AI
     const systemPrompt = `Ты — независимый профессиональный спортивный аналитик мирового уровня и эксперт по вероятностному прогнозированию спортивных событий (ORAKUL AI).
@@ -1192,7 +1243,19 @@ K. Финальный JSON соответствует существующему
       );
     }
 
-    const engineProbabilities = calculateProbabilities(parsedVDP);
+    // STEP 18: Engine Bridge — подтверждённый DataPack.form заполняет ТОЛЬКО
+    // реально отсутствующие матчи команд. Валидный ParsedVDP всегда приоритетен;
+    // H2H и opponentStrength/venue не синтезируются. Engine не изменяется.
+    const mergedVDP = mergeEngineInput(parsedVDP, dalDataPack);
+    console.log('[ORAKUL DIAGNOSTIC] Engine bridge:', JSON.stringify({
+      t1Before: parsedVDP.team1.matches.length,
+      t1After: mergedVDP.team1.matches.length,
+      t2Before: parsedVDP.team2.matches.length,
+      t2After: mergedVDP.team2.matches.length,
+      h2h: mergedVDP.h2h.length,
+    }));
+
+    const engineProbabilities = calculateProbabilities(mergedVDP);
     console.log('[ORAKUL DIAGNOSTIC] Engine probabilities:', JSON.stringify(engineProbabilities));
 
     const userPrompt = `Матч для анализа: "${trimmedMatch}"
@@ -1320,6 +1383,14 @@ ${truncatedResearchReport}
 
     // Если LLM не вернул match (или вернул пустую строку) — используем исходный пользовательский запрос.
     contract.match = contract.match || trimmedMatch;
+
+    // A1: Probability Engine — единственный источник числовых вероятностей.
+    // LLM отвечает только за текстовый анализ; числовые вероятности всегда берём из engineProbabilities.
+    contract.probabilities = {
+      team1: engineProbabilities.team1,
+      draw: engineProbabilities.draw,
+      team2: engineProbabilities.team2,
+    };
 
     const validationError = validateAnalysisContract(contract);
     if (validationError) {
