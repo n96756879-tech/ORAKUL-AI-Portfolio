@@ -1,6 +1,9 @@
 import { NextResponse } from 'next/server';
 import { parseVDP } from '@/lib/vdp-parser';
+import type { ParsedVDP } from '@/lib/vdp-parser';
 import { calculateProbabilities } from '@/lib/probability-engine';
+import { calculateGoalDistribution } from '@/lib/goal-distribution';
+import type { GoalDistributionInput } from '@/lib/goal-distribution';
 import { extractVDP } from '@/lib/vdp-extractor';
 import {
   assembleVdp,
@@ -14,6 +17,24 @@ import {
   getOrRunResearch,
 } from '@/lib/data';
 import type { DataPack } from '@/lib/data';
+
+export function buildGoalDistributionInput(vdp: ParsedVDP): GoalDistributionInput {
+  const mapTeam = (team: ParsedVDP['team1']) => ({
+    matches: team.matches.map((match) => ({
+      goalsFor: match.goalsFor ?? undefined,
+      goalsAgainst: match.goalsAgainst ?? undefined,
+      result: match.result,
+      opponentStrength: match.opponentStrength,
+      venue: match.venue,
+    })),
+  });
+
+  return {
+    team1: mapTeam(vdp.team1),
+    team2: mapTeam(vdp.team2),
+    h2h: vdp.h2h,
+  };
+}
 
 // Парсер ORAKUL_DAL_SOURCE_URLS: «normalized match key|URL», элементы через «;;».
 // Пример: football|belgium|vs|france|;;https://www.uefa.com/... (секреты не содержит).
@@ -1256,7 +1277,32 @@ K. Финальный JSON соответствует существующему
     }));
 
     const engineProbabilities = calculateProbabilities(mergedVDP);
-    console.log('[ORAKUL DIAGNOSTIC] Engine probabilities:', JSON.stringify(engineProbabilities));
+    console.log('[ORAKUL DIAGNOSTIC] Probability Engine:', `team1=${engineProbabilities.team1} draw=${engineProbabilities.draw} team2=${engineProbabilities.team2}`);
+
+    const goalDistribution = calculateGoalDistribution(buildGoalDistributionInput(mergedVDP));
+    console.log('[ORAKUL DIAGNOSTIC] Goal Distribution:', `lambda1=${goalDistribution.lambda1} lambda2=${goalDistribution.lambda2} residual=${goalDistribution.diagnostics.residual}`);
+    if (goalDistribution.diagnostics.usedFallbacks.length > 0) {
+      console.log('[ORAKUL DIAGNOSTIC] Goal Distribution:', `usedFallbacks=${JSON.stringify(goalDistribution.diagnostics.usedFallbacks)}`);
+    }
+    console.log('[ORAKUL DIAGNOSTIC] Goal Distribution markets:', JSON.stringify({
+      result: goalDistribution.markets.result,
+      doubleChance: goalDistribution.markets.doubleChance,
+      totals: goalDistribution.markets.totals,
+      btts: goalDistribution.markets.btts,
+      teamScoring: goalDistribution.markets.teamScoring,
+    }));
+
+    const goalDistributionForLlm = {
+      lambda1: goalDistribution.lambda1,
+      lambda2: goalDistribution.lambda2,
+      markets: {
+        result: goalDistribution.markets.result,
+        doubleChance: goalDistribution.markets.doubleChance,
+        totals: goalDistribution.markets.totals,
+        btts: goalDistribution.markets.btts,
+        teamScoring: goalDistribution.markets.teamScoring,
+      },
+    };
 
     const userPrompt = `Матч для анализа: "${trimmedMatch}"
 
@@ -1268,7 +1314,12 @@ ${truncatedResearchReport}
 * draw: ${engineProbabilities.draw}%
 * team2: ${engineProbabilities.team2}%
 
-Эти числа уже рассчитаны Probability Engine и являются окончательными. Ты НЕ должен пересчитывать, изменять или предлагать другие вероятности. Используй эти числа только для формирования текстового объяснения (explanation) — объясни, почему именно такие вероятности следуют из фактов Research Report. В итоговом JSON верни ровно эти числа в полях "probabilities.team1", "probabilities.draw", "probabilities.team2".`;
+Эти числа уже рассчитаны Probability Engine и являются окончательными. Ты НЕ должен пересчитывать, изменять или предлагать другие вероятности. Используй эти числа только для формирования текстового объяснения (explanation) — объясни, почему именно такие вероятности следуют из фактов Research Report. В итоговом JSON верни ровно эти числа в полях "probabilities.team1", "probabilities.draw", "probabilities.team2".
+
+GOAL DISTRIBUTION (рассчитано production engine):
+${JSON.stringify(goalDistributionForLlm)}
+
+Значения Goal Distribution рассчитаны production engine и являются authoritative numerical inputs. Не пересчитывай, не изменяй и не заменяй lambda, score probabilities или derived markets. Используй их только для объяснения анализа. Не вычисляй новые числовые прогнозы и не подменяй ими authoritative 1X2 probabilities.`;
 
     // DIAGNOSTIC: размеры payload перед отправкой в KeyDealer (без секретов)
     const diagnosticPayload = JSON.stringify({
@@ -1289,59 +1340,55 @@ ${truncatedResearchReport}
       messagesPayloadChars: diagnosticPayload.length,
     }));
 
-    // ВРЕМЕННАЯ ДИАГНОСТИКА (убрать после диагностики): полный VERIFIED DATA PACK перед отправкой в Sonnet.
-    console.log('[ORAKUL DIAGNOSTIC] VERIFIED DATA PACK:', normalizedResearchReport);
-
-    // 5. ЕДИНСТВЕННЫЙ запрос к KeyDealer/LLM (sonnet-4-6)
-    let chatRes: Response;
-    try {
-      chatRes = await fetch('https://api.keydealer.ru/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${keydealerApiKey}`,
-        },
-        body: JSON.stringify({
-          model: 'sonnet-4-6',
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userPrompt },
-          ],
-          temperature: 0.1,
-        }),
-      });
-    } catch (networkError: any) {
-      const safeLLMErr = JSON.stringify({
-        message: String(networkError?.message || networkError),
-        name: String(networkError?.name || 'Error'),
-      });
-      console.error('KeyDealer LLM fetch network error:', safeLLMErr);
-      return NextResponse.json(
-        { error: `LLM API connection error: ${safeLLMErr}` },
-        { status: 502 }
-      );
-    }
-
-    if (!chatRes.ok) {
-      const errBody = await chatRes.text();
-      const safeErrBody = sanitizeSecrets(errBody);
-      console.error(`KeyDealer LLM HTTP error: ${chatRes.status}`, safeErrBody);
-      console.log('[ORAKUL DIAGNOSTIC] LLM response error:', JSON.stringify({
-        httpStatus: chatRes.status,
-        responseBodyFirst500Chars: safeErrBody.slice(0, 500),
-      }));
-      return NextResponse.json(
-        { error: `LLM API error: HTTP ${chatRes.status} — ${safeErrBody}` },
-        { status: 502 }
-      );
-    }
-
-    const chatData = await chatRes.json();
-    const rawContent = chatData?.choices?.[0]?.message?.content || '';
-
     let rawParsed: any;
-    try {
-      const cleanedJson = rawContent
+    let parsedAfterRetry = false;
+    for (let llmAttempt = 0; llmAttempt < 2; llmAttempt += 1) {
+      let chatRes: Response;
+      try {
+        chatRes = await fetch('https://api.keydealer.ru/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${keydealerApiKey}`,
+          },
+          body: JSON.stringify({
+            model: 'sonnet-4-6',
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: userPrompt },
+            ],
+            temperature: 0.1,
+          }),
+        });
+      } catch (networkError: any) {
+        const safeLLMErr = JSON.stringify({
+          message: String(networkError?.message || networkError),
+          name: String(networkError?.name || 'Error'),
+        });
+        console.error('KeyDealer LLM fetch network error:', safeLLMErr);
+        return NextResponse.json(
+          { error: `LLM API connection error: ${safeLLMErr}` },
+          { status: 502 }
+        );
+      }
+
+      if (!chatRes.ok) {
+        const errBody = await chatRes.text();
+        const safeErrBody = sanitizeSecrets(errBody);
+        console.error(`KeyDealer LLM HTTP error: ${chatRes.status}`, safeErrBody);
+        console.log('[ORAKUL DIAGNOSTIC] LLM response error:', JSON.stringify({
+          httpStatus: chatRes.status,
+          responseBodyFirst500Chars: safeErrBody.slice(0, 500),
+        }));
+        return NextResponse.json(
+          { error: `LLM API error: HTTP ${chatRes.status} — ${safeErrBody}` },
+          { status: 502 }
+        );
+      }
+
+      const chatData = await chatRes.json();
+      const rawContent = chatData?.choices?.[0]?.message?.content || '';
+      const cleanedJson = String(rawContent)
         .replace(/^```json\s*/i, '')
         .replace(/^```\s*/i, '')
         .replace(/```$/i, '')
@@ -1351,25 +1398,39 @@ ${truncatedResearchReport}
         model: 'sonnet-4-6',
         httpStatus: chatRes.status,
         rawContentLength: String(rawContent).length,
-        rawContentFirst3000Chars: String(rawContent).slice(0, 3000),
-        cleanedJsonFirst3000Chars: String(cleanedJson).slice(0, 3000),
+        cleanedJsonLength: cleanedJson.length,
       }));
 
-      rawParsed = JSON.parse(cleanedJson);
-    } catch (parseError: any) {
-      console.error('JSON parse error from LLM:', parseError);
-      console.log('[ORAKUL DIAGNOSTIC] JSON.parse error:', JSON.stringify({
-        model: 'sonnet-4-6',
-        httpStatus: chatRes.status,
-        rawContentLength: String(rawContent).length,
-        rawContentFirst3000Chars: String(rawContent).slice(0, 3000),
-        parseErrorMessage: parseError?.message || String(parseError),
-      }));
-      console.log('[ORAKUL DIAGNOSTIC] rawContent first 300 chars:', JSON.stringify(String(rawContent).slice(0, 300)));
-      return NextResponse.json(
-        { error: 'LLM response was not valid JSON.' },
-        { status: 502 }
-      );
+      try {
+        rawParsed = JSON.parse(cleanedJson);
+        parsedAfterRetry = llmAttempt === 1;
+        break;
+      } catch (parseError: any) {
+        console.error('JSON parse error from LLM:', parseError);
+        console.log('[ORAKUL DIAGNOSTIC] JSON.parse error:', JSON.stringify({
+          model: 'sonnet-4-6',
+          httpStatus: chatRes.status,
+          rawContentLength: String(rawContent).length,
+          parseErrorMessage: parseError?.message || String(parseError),
+        }));
+
+        if (llmAttempt === 0 && String(rawContent).length > 0 && cleanedJson.length > 0) {
+          console.log('[LLM] JSON parse failed, retrying once');
+          continue;
+        }
+
+        if (llmAttempt === 1) {
+          console.log('[LLM] JSON retry failed');
+        }
+        return NextResponse.json(
+          { error: 'LLM response was not valid JSON.' },
+          { status: 502 }
+        );
+      }
+    }
+
+    if (parsedAfterRetry) {
+      console.log('[LLM] JSON retry succeeded');
     }
 
     const contract = buildAnalysisContract(rawParsed);
@@ -1384,6 +1445,14 @@ ${truncatedResearchReport}
     // Если LLM не вернул match (или вернул пустую строку) — используем исходный пользовательский запрос.
     contract.match = contract.match || trimmedMatch;
 
+    const llmProbabilities = extractProbabilities(contract);
+    if (llmProbabilities) {
+      console.log('[ORAKUL DIAGNOSTIC] LLM Contract probabilities:', `team1=${llmProbabilities.team1} draw=${llmProbabilities.draw} team2=${llmProbabilities.team2}`);
+    } else {
+      console.log('[ORAKUL DIAGNOSTIC] LLM Contract probabilities: INVALID');
+    }
+    console.log('[ORAKUL DIAGNOSTIC] Engine vs LLM:', `engine=${engineProbabilities.team1}/${engineProbabilities.draw}/${engineProbabilities.team2} llm=${llmProbabilities ? `${llmProbabilities.team1}/${llmProbabilities.draw}/${llmProbabilities.team2}` : 'INVALID'} match=${llmProbabilities !== null && llmProbabilities.team1 === engineProbabilities.team1 && llmProbabilities.draw === engineProbabilities.draw && llmProbabilities.team2 === engineProbabilities.team2}`);
+
     // A1: Probability Engine — единственный источник числовых вероятностей.
     // LLM отвечает только за текстовый анализ; числовые вероятности всегда берём из engineProbabilities.
     contract.probabilities = {
@@ -1391,6 +1460,8 @@ ${truncatedResearchReport}
       draw: engineProbabilities.draw,
       team2: engineProbabilities.team2,
     };
+    console.log('[ORAKUL DIAGNOSTIC] A1 final probabilities:', `team1=${contract.probabilities.team1} draw=${contract.probabilities.draw} team2=${contract.probabilities.team2}`);
+    console.log('[ORAKUL DIAGNOSTIC] A1 vs Engine:', `engine=${engineProbabilities.team1}/${engineProbabilities.draw}/${engineProbabilities.team2} a1=${contract.probabilities.team1}/${contract.probabilities.draw}/${contract.probabilities.team2} match=${contract.probabilities.team1 === engineProbabilities.team1 && contract.probabilities.draw === engineProbabilities.draw && contract.probabilities.team2 === engineProbabilities.team2}`);
 
     const validationError = validateAnalysisContract(contract);
     if (validationError) {
@@ -1406,6 +1477,8 @@ ${truncatedResearchReport}
     }
 
     const response = adaptAnalysisContractToResponse(contract, trimmedMatch, researchSources);
+    const publicProbabilities = response.probabilities.outcomes.map((outcome: { value: string }) => toProbabilityNumber(outcome.value));
+    console.log('[ORAKUL DIAGNOSTIC] Public Response probabilities:', `team1=${publicProbabilities[0]} draw=${publicProbabilities[1]} team2=${publicProbabilities[2]}`);
 
     return NextResponse.json(response);
   } catch (error: any) {

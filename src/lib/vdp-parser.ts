@@ -76,7 +76,7 @@ function parseScore(raw: string): { goalsFor: number | null; goalsAgainst: numbe
 
   s = s.replace(/\s*aet\b/i, "").replace(/\s*\(aet\)/i, "").trim();
 
-  const scoreRe = /^(\d+)\s*[-–]\s*(\d+)/;
+  const scoreRe = /(\d+)\s*[-–]\s*(\d+)/;
   const sm = s.match(scoreRe);
   if (sm) {
     return { goalsFor: parseInt(sm[1], 10), goalsAgainst: parseInt(sm[2], 10), penaltyShootout };
@@ -119,7 +119,7 @@ function splitIntoSections(text: string): Map<string, string[]> {
 
   const teamHeaderRe = /^TEAM\s*([12])\s*(?:(?:[-—–]\s*RECENT\s*FORM\s*:\s*.+)|FORM(?:\s*[-—–:]\s*.+)?)$/i;
   const h2hHeaderRe = /^(?:H2H|HEAD[-.]?TO[-.]?HEAD)$/i;
-  const sectionRe = /^(?:TEAM\s*[12]\s*(?:(?:[-—–]\s*RECENT\s*FORM\s*:\s*.+)|FORM(?:\s*[-—–:]\s*.+)?)|MATCH(?:\s+VERIFICATION)?\s*$|MATCH\s*[1-5]|H2H\s*[1-5]|FORM\s*SUMMARY|H2H|VERIFIED\s*DATA\s*PACK|HEAD[-.]?TO[-.]?HEAD)$/i;
+  const sectionRe = /^(?:TEAM\s*[12]\s*(?:(?:[-—–]\s*RECENT\s*FORM\s*:\s*.+)|FORM(?:\s*[-—–:]\s*.+)?)|MATCH(?:\s+VERIFICATION)?\s*$|MATCH\s*[1-5](?:\s*[-—–].*)?|H2H\s*[1-5]|FORM\s*SUMMARY|H2H|VERIFIED\s*DATA\s*PACK|HEAD[-.]?TO[-.]?HEAD)$/i;
 
   for (const rawLine of text.split(/\r?\n/)) {
     const line = rawLine.trimEnd();
@@ -143,6 +143,8 @@ function splitIntoSections(text: string): Map<string, string[]> {
           : `TEAM ${teamHeader[1]} FORM`;
       } else if (/^H2H\s*[1-5]$/i.test(stripped)) {
         baseKey = `MATCH ${stripped.match(/^H2H\s*([1-5])$/i)![1]}`;
+      } else if (/^MATCH\s*[1-5]/i.test(stripped)) {
+        baseKey = `MATCH ${stripped.match(/^MATCH\s*([1-5])/i)![1]}`;
       } else {
         baseKey = stripped.toUpperCase().replace(/\s+/g, " ").replace(/[—–]/g, "-");
       }
@@ -256,7 +258,9 @@ function extractMatches(sections: Map<string, string[]>, teamPrefix: RegExp): Pa
 
 function parseTeam(sections: Map<string, string[]>, teamFormPattern: RegExp): ParsedTeam {
   const formLines = findSectionLines(sections, teamFormPattern);
-  const teamName = formLines ? extractTeamName(formLines) : null;
+  const formKey = [...sections.keys()].find(key => teamFormPattern.test(key.replace(/^TEAM[12]:/, '')));
+  const headerName = formKey?.match(/RECENT FORM\s*:\s*(.+)$/i)?.[1]?.trim() || null;
+  const teamName = headerName || (formLines ? extractTeamName(formLines) : null);
 
   const teamSections = new Map<string, string[]>();
   let inTeamScope = false;
@@ -339,7 +343,55 @@ function parseH2HNumbered(lines: string[]): ParsedH2H[] {
       if (/^(?:CONFIDENCE|STATUS)\s*:/i.test(sl)) status = sl.replace(/^(?:CONFIDENCE|STATUS)\s*:\s*/i, '').trim();
     }
 
-    entries.push({ date, competition, score, winner, source, status });
+    if (isConcreteH2H(date, score)) {
+      entries.push({ date, competition, score, winner: normalizeH2HWinner(score, winner), source, status });
+    }
+  }
+  return entries;
+}
+
+function normalizeTeamName(name: string): string {
+  return name.toLocaleLowerCase().replace(/[üÜ]/g, "u").replace(/[^a-z0-9а-яё]/gi, "");
+}
+
+function parseH2HPlain(lines: string[], team1: string | null, team2: string | null): ParsedH2H[] {
+  if (!team1 || !team2) return [];
+  const expected = [normalizeTeamName(team1), normalizeTeamName(team2)];
+  const lineRe = /^\s*(.+?)\s+(\d+\s*[-–—]\s*\d+)\s+([^.;]+?)\s*$/u;
+  const entries: ParsedH2H[] = [];
+
+  for (const rawLine of lines) {
+    const line = stripMd(rawLine).replace(/^\s*\d+\.\s*/, "");
+    const dateMatch = line.match(/^(\d{2}\.\d{2}\.\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2}\s+[A-Za-z]{3}\s+\d{4})(?:\s*:\s*|\s*[—–-]\s*)/iu);
+    const dateOnly = line.match(/^(\d{2}\.\d{2}\.\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2}\s+[A-Za-z]{3}\s+\d{4})/iu);
+    const date = dateMatch?.[1] || dateOnly?.[1] || null;
+    const content = dateMatch
+      ? line.slice(dateMatch[0].length)
+      : dateOnly
+        ? line.slice(dateOnly[0].length).replace(/^\s*[—–:-]\s*/, "")
+        : line;
+    const match = content.match(lineRe);
+    if (!match) continue;
+    const body = match[1].trim();
+    const left = body;
+    const right = match[3].trim();
+    const teams = [normalizeTeamName(left), normalizeTeamName(right)];
+    if (!teams.includes(expected[0]) || !teams.includes(expected[1]) || teams[0] === teams[1]) continue;
+
+    const score = match[2].replace(/\s/g, "");
+    const scoreParts = score.split(/[—–-]/).map(Number);
+    const leftIsTeam1 = teams[0] === expected[0];
+    let winner: string | null = null;
+    if (scoreParts[0] === scoreParts[1]) winner = "DRAW";
+    else winner = scoreParts[0] > scoreParts[1] ? left : right;
+    entries.push({
+      date,
+      competition: null,
+      score: leftIsTeam1 ? score : `${scoreParts[1]}-${scoreParts[0]}`,
+      winner: leftIsTeam1 ? winner : (winner === "DRAW" ? winner : (winner === left ? team2 : team1)),
+      source: null,
+      status: null,
+    });
   }
   return entries;
 }
@@ -379,15 +431,42 @@ function parseH2HBullets(lines: string[]): ParsedH2H[] {
       // stop if we hit a new header or empty gap after a few lines
       if (/^#{1,6}\s/.test(lines[j]) || (/^\s*$/.test(lines[j]) && j > i + 3)) break;
     }
-    if (date || score || winner) {
-      entries.push({ date, competition, score, winner, source, status });
+    if (isConcreteH2H(date, score)) {
+      entries.push({ date, competition, score, winner: normalizeH2HWinner(score, winner), source, status });
     }
     i++;
   }
   return entries;
 }
 
-function parseH2H(sections: Map<string, string[]>): ParsedH2H[] {
+function isConcreteH2H(date: string | null, score: string | null): boolean {
+  return Boolean(
+    score && /\d+\s*[–—-]\s*\d+/.test(score) &&
+    (!date || /^(?:\d{2}\.\d{2}\.\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2}\s+[A-Za-z]{3}\s+\d{4})\.?$/.test(date.trim())),
+  );
+}
+
+function normalizeH2HWinner(score: string | null, winner: string | null): string | null {
+  const normalizedWinner = winner?.trim().replace(/[.]$/, '').toUpperCase();
+  if (normalizedWinner === 'DRAW' || normalizedWinner === 'NO WINNER') return 'DRAW';
+
+  const scoreMatch = score?.match(/(\d+)\s*[–—-]\s*(\d+)/);
+  if (scoreMatch && scoreMatch[1] === scoreMatch[2]) return 'DRAW';
+  return winner;
+}
+
+function deduplicateH2H(entries: ParsedH2H[]): ParsedH2H[] {
+  const seen = new Set<string>();
+  return entries.filter((entry) => {
+    const score = entry.score?.replace(/\s+/g, '').replace(/[–—]/g, '-') || '';
+    const key = `${entry.date?.trim() || ''}|${score}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function parseH2H(sections: Map<string, string[]>, team1: string | null, team2: string | null): ParsedH2H[] {
   const entries: ParsedH2H[] = [];
 
   for (let i = 1; i <= 5; i++) {
@@ -406,18 +485,18 @@ function parseH2H(sections: Map<string, string[]>): ParsedH2H[] {
       const winner = getField(ml, "WINNER");
       const source = getField(ml, "SOURCE");
       const status = getField(ml, "STATUS");
-      if (date || score || winner) {
-        entries.push({ date, competition, score, winner, source, status });
+       if (isConcreteH2H(date, score)) {
+        entries.push({ date, competition, score, winner: normalizeH2HWinner(score, winner), source, status });
       }
     }
   }
 
-  if (entries.length > 0) return entries;
+  if (entries.length > 0) return deduplicateH2H(entries);
 
   for (const [key, lines] of sections) {
     if (/^H2H:HEAD[-\s]?TO[-\s]?HEAD$/i.test(key)) {
       const numbered = parseH2HNumbered(lines);
-      if (numbered.length > 0) return numbered;
+      if (numbered.length > 0) return deduplicateH2H(numbered);
     }
   }
 
@@ -429,9 +508,11 @@ function parseH2H(sections: Map<string, string[]>): ParsedH2H[] {
       if (isH2HKey) {
         // try numbered first (for ### 1. style under it)
         const numbered = parseH2HNumbered(lines);
-        if (numbered.length > 0) return numbered;
+        if (numbered.length > 0) return deduplicateH2H(numbered);
+        const plain = parseH2HPlain(lines, team1, team2);
+        if (plain.length > 0) return deduplicateH2H(plain);
         const bullets = parseH2HBullets(lines);
-        if (bullets.length > 0) return bullets;
+        if (bullets.length > 0) return deduplicateH2H(bullets);
       }
     }
   }
@@ -484,8 +565,8 @@ function extractTeamNamesFromFormHeaders(report: string): { team1: string | null
 export function parseVDP(report: string): ParsedVDP {
   const sections = splitIntoSections(report);
 
-  const team1 = parseTeam(sections, /^TEAM\s*1\s*(FORM|- RECENT FORM)$/i);
-  const team2 = parseTeam(sections, /^TEAM\s*2\s*(FORM|- RECENT FORM)$/i);
+  const team1 = parseTeam(sections, /^TEAM\s*1\s*(FORM|- RECENT FORM)(?:\s*:\s*.+)?$/i);
+  const team2 = parseTeam(sections, /^TEAM\s*2\s*(FORM|- RECENT FORM)(?:\s*:\s*.+)?$/i);
 
   if (!team1.teamName || !team2.teamName) {
     const fromPreamble = extractTeamNamesFromPreamble(sections);
@@ -505,7 +586,7 @@ export function parseVDP(report: string): ParsedVDP {
     if (!team2.teamName && fromTitle.team2) team2.teamName = fromTitle.team2;
   }
 
-  const h2h = parseH2H(sections);
+  const h2h = parseH2H(sections, team1.teamName, team2.teamName);
 
   return { team1, team2, h2h };
 }

@@ -16,6 +16,171 @@ import {
   buildIncompleteVdp,
 } from './helpers/fixtures';
 
+const oldArmeniaMontenegroVdp = `# VERIFIED DATA PACK
+
+## TEAM 1 - RECENT FORM: ARMENIA
+### MATCH 1
+- **DATE:** 25.09.2026
+- **OPPONENT:** Latvia
+- **HOME/AWAY:** Home
+- **SCORE:** Armenia 2–0 Latvia
+- **RESULT:** W
+### MATCH 2
+- **DATE:** 16.11.2025
+- **OPPONENT:** Portugal
+- **HOME/AWAY:** Away
+- **SCORE:** Portugal 9–1 Armenia
+- **RESULT:** L
+### MATCH 3
+- **DATE:** 14.11.2025
+- **OPPONENT:** Hungary
+- **HOME/AWAY:** Home
+- **SCORE:** Armenia 0–1 Hungary
+- **RESULT:** L
+### MATCH 4
+- **DATE:** 11.10.2025
+- **OPPONENT:** Ireland
+- **HOME/AWAY:** Away
+- **SCORE:** Ireland 1–0 Armenia
+- **RESULT:** L
+### MATCH 5
+- **DATE:** 09.09.2025
+- **OPPONENT:** Portugal
+- **HOME/AWAY:** Home
+- **SCORE:** Armenia 0–5 Portugal
+- **RESULT:** L
+
+## TEAM 2 - RECENT FORM: MONTENEGRO
+### MATCH 1
+- **DATE:** 25.09.2026
+- **OPPONENT:** Gibraltar
+- **HOME/AWAY:** Away
+- **SCORE:** Gibraltar 0–1 Montenegro
+- **RESULT:** W
+### MATCH 2
+- **DATE:** 17.11.2025
+- **OPPONENT:** Croatia
+- **HOME/AWAY:** Away
+- **SCORE:** Croatia 4–0 Montenegro
+- **RESULT:** L
+### MATCH 3
+- **DATE:** 14.11.2025
+- **OPPONENT:** Iceland
+- **HOME/AWAY:** Home
+- **SCORE:** Montenegro 2–0 Iceland
+- **RESULT:** W
+### MATCH 4
+- **DATE:** 09.10.2025
+- **OPPONENT:** Czechia
+- **HOME/AWAY:** Away
+- **SCORE:** Czechia 2–0 Montenegro
+- **RESULT:** L
+### MATCH 5
+- **DATE:** 06.09.2025
+- **OPPONENT:** Faroe Islands
+- **HOME/AWAY:** Away
+- **SCORE:** Faroe Islands 4–0 Montenegro
+- **RESULT:** L
+
+## H2H
+### H2H 1
+- **DATE:** 06.06.2025
+- **SCORE:** 2-2
+- **WINNER:** Draw
+`;
+
+const newArmeniaMontenegroVdp = `# VERIFIED DATA PACK
+
+## MATCH VERIFICATION
+- **FACT:** Armenia vs Montenegro, UEFA Nations League 2026/27
+
+## TEAM 1 — RECENT FORM: ARMENIA
+### MATCH 1
+- **DATE:** 25.09.2026
+- **COMPETITION:** UEFA Nations League
+- **OPPONENT:** Latvia
+- **HOME/AWAY:** Home
+- **SCORE:** Armenia 2–0 Latvia
+- **RESULT:** W
+- **OPPONENT_STRENGTH:** UNKNOWN
+### MATCH 2
+- **DATE:** 16.11.2025
+- **COMPETITION:** World Cup Qualifiers
+- **OPPONENT:** Portugal
+- **HOME/AWAY:** Away
+- **SCORE:** Portugal 9–1 Armenia
+- **RESULT:** L
+### MATCH 3
+- **DATE:** 14.11.2025
+- **COMPETITION:** World Cup Qualifiers
+- **OPPONENT:** Hungary
+- **HOME/AWAY:** Home
+- **SCORE:** Armenia 0–1 Hungary
+- **RESULT:** L
+### MATCH 4
+- **DATE:** 11.10.2025
+- **COMPETITION:** World Cup Qualifiers
+- **OPPONENT:** Ireland
+- **HOME/AWAY:** Away
+- **SCORE:** Ireland 1–0 Armenia
+- **RESULT:** L
+### MATCH 5
+- **DATE:** 09.09.2025
+- **COMPETITION:** World Cup Qualifiers
+- **OPPONENT:** Portugal
+- **HOME/AWAY:** Home
+- **SCORE:** Armenia 0–5 Portugal
+- **RESULT:** L
+
+## TEAM 2 — RECENT FORM: MONTENEGRO
+### MATCH 1
+- **DATE:** 25.09.2026
+- **COMPETITION:** UEFA Nations League
+- **OPPONENT:** Gibraltar
+- **HOME/AWAY:** Away
+- **SCORE:** Gibraltar 0–1 Montenegro
+- **RESULT:** W
+- **OPPONENT_STRENGTH:** UNKNOWN
+### MATCH 2
+- **DATE:** 17.11.2025
+- **COMPETITION:** World Cup Qualifiers
+- **OPPONENT:** Croatia
+- **HOME/AWAY:** Away
+- **SCORE:** Croatia 4–0 Montenegro
+- **RESULT:** L
+### MATCH 3
+- **DATE:** 14.11.2025
+- **COMPETITION:** World Cup Qualifiers
+- **OPPONENT:** Iceland
+- **HOME/AWAY:** Home
+- **SCORE:** Montenegro 2–0 Iceland
+- **RESULT:** W
+### MATCH 4
+- **DATE:** 09.10.2025
+- **COMPETITION:** World Cup Qualifiers
+- **OPPONENT:** Czechia
+- **HOME/AWAY:** Away
+- **SCORE:** Czechia 2–0 Montenegro
+- **RESULT:** L
+### MATCH 5
+- **DATE:** 06.09.2025
+- **COMPETITION:** World Cup Qualifiers
+- **OPPONENT:** Faroe Islands
+- **HOME/AWAY:** Away
+- **SCORE:** Faroe Islands 4–0 Montenegro
+- **RESULT:** L
+
+## H2H
+### H2H 1
+- **DATE:** 06.06.2025
+- **SCORE:** 2–2
+- **WINNER:** Draw
+### H2H 2
+- **DATE:** 12.11.2020
+- **SCORE:** 0–0
+- **WINNER:** Draw
+`;
+
 describe('P0 VDP Parser (current behavior)', () => {
   let fullParsed: ReturnType<typeof parseVDP>;
 
@@ -79,7 +244,7 @@ describe('P0 VDP Parser (current behavior)', () => {
   test('T5: missing fields — no crash, result defaults to UNKNOWN', () => {
     const parsed = parseVDP(buildMissingFieldsVdp());
     assert.equal(parsed.team1.matches.length, 5);
-    const [m1, m2, m3, m4, m5] = parsed.team1.matches;
+    const [m1, m2, , m4, m5] = parsed.team1.matches;
 
     assert.equal(m1.result, 'W');
     // MATCH 2: RESULT отсутствует -> UNKNOWN
@@ -121,5 +286,113 @@ describe('P0 VDP Parser (current behavior)', () => {
     assert.equal(parsed.team2.matches.length, 5);
     assert.ok(Array.isArray(parsed.h2h));
   });
-});
 
+  test('T7: Armenia-Montenegro OLD and NEW Research VDP formats', () => {
+    for (const raw of [oldArmeniaMontenegroVdp, newArmeniaMontenegroVdp]) {
+      const parsed = parseVDP(raw);
+      assert.equal(parsed.team1.teamName, 'ARMENIA');
+      assert.equal(parsed.team2.teamName, 'MONTENEGRO');
+      assert.equal(parsed.team1.matches.length, 5);
+      assert.equal(parsed.team2.matches.length, 5);
+      assert.equal(parsed.team1.matches[0].result, 'W');
+      assert.notEqual(parsed.team1.matches[0].goalsFor, null);
+      assert.notEqual(parsed.team1.matches[0].goalsAgainst, null);
+      assert.equal(parsed.team2.matches[0].result, 'W');
+      assert.notEqual(parsed.team2.matches[0].goalsFor, null);
+      assert.notEqual(parsed.team2.matches[0].goalsAgainst, null);
+      assert.ok(parsed.h2h.length > 0);
+    }
+  });
+
+  test('T8: concrete draw normalizes No winner to DRAW', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## HEAD-TO-HEAD
+### H2H 1
+- **DATE:** 09.06.2025
+- **TOURNAMENT:** International friendly
+- **SCORE:** Montenegro 2-2 Armenia
+- **WINNER:** No winner
+`);
+
+    assert.equal(parsed.h2h.length, 1);
+    assert.equal(parsed.h2h[0].winner, 'DRAW');
+  });
+
+  test('T9: aggregate H2H summary is not a match', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## H2H
+- **FACT:** Armenia 2 wins, Montenegro 1 win, Draw 1
+- **DATE:** Aggregate period
+- **SOURCE:** FootyStats
+- **STATUS:** PARTIALLY_CONFIRMED
+`);
+
+    assert.equal(parsed.h2h.length, 0);
+  });
+
+  test('T10: different meetings with the same score are retained', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## H2H
+- **FACT:** Montenegro 2-2 Armenia
+- **DATE:** 09.06.2025
+- **SCORE:** Montenegro 2-2 Armenia
+- **WINNER:** Draw
+- **STATUS:** CONFIRMED
+- **FACT:** Montenegro 2-2 Armenia
+- **DATE:** 10.06.2017
+- **SCORE:** Montenegro 2-2 Armenia
+- **WINNER:** DRAW
+- **STATUS:** CONFIRMED
+`);
+
+    assert.equal(parsed.h2h.length, 2);
+    assert.deepEqual(parsed.h2h.map((entry) => entry.date), ['09.06.2025', '10.06.2017']);
+  });
+
+  test('T11: free-form H2H keeps only concrete Turkey/Türkiye-Italy meetings', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** Türkiye–Italy, UEFA Nations League
+
+## HEAD-TO-HEAD
+20.09.2026 — Türkiye 2–1 Italy
+20 Sep 2025 — Türkiye 2-1 Italy
+2024-09-20: Türkiye 2-1 Italy
+Türkiye 2-1 Italy
+Italy 0-0 Türkiye
+Italy 4-0 Spain
+Türkiye and Italy have met 12 times
+`);
+
+    assert.equal(parsed.h2h.length, 4);
+    assert.deepEqual(parsed.h2h.map((entry) => entry.date), [
+      '20 Sep 2025',
+      '2024-09-20',
+      null,
+      null,
+    ]);
+    assert.deepEqual(parsed.h2h.map((entry) => entry.winner), ['Türkiye', 'Türkiye', 'Türkiye', 'DRAW']);
+  });
+
+  test('T12: H2H requires both a supported date and score, and exact duplicates are removed', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** Turkey vs Italy
+
+## H2H
+2026-09-20: Turkey 2-1 Italy
+2026-09-20: Turkey 2-1 Italy
+Turkey 1-1 Italy
+Turkey beat Italy
+`);
+
+    assert.equal(parsed.h2h.length, 2);
+    assert.equal(parsed.h2h[0].winner, 'Turkey');
+    assert.equal(parsed.h2h[1].winner, 'DRAW');
+  });
+});
