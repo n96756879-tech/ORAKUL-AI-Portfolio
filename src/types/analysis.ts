@@ -25,6 +25,8 @@ export interface AnalysisResult {
   };
   probabilities: {
     outcomes: ProbabilityMarket[];
+    totals?: ProbabilityMarket[];
+    btts?: ProbabilityMarket[];
   };
   explanation: AnalysisExplanation;
   usedSources: AnalysisSource[];

@@ -3,7 +3,7 @@ import { parseVDP } from '@/lib/vdp-parser';
 import type { ParsedVDP } from '@/lib/vdp-parser';
 import { calculateProbabilities } from '@/lib/probability-engine';
 import { calculateGoalDistribution } from '@/lib/goal-distribution';
-import type { GoalDistributionInput } from '@/lib/goal-distribution';
+import type { GoalDistributionInput, GoalDistributionResult } from '@/lib/goal-distribution';
 import { extractVDP } from '@/lib/vdp-extractor';
 import {
   assembleVdp,
@@ -446,6 +446,7 @@ function adaptAnalysisContractToResponse(
   contract: Record<string, any>,
   trimmedMatch: string,
   researchSources: ResearchSource[],
+  goalDistribution: GoalDistributionResult,
 ) {
   const matchTitle = contract.match || trimmedMatch;
   const probabilities = contract.probabilities;
@@ -472,6 +473,18 @@ function adaptAnalysisContractToResponse(
         { label: 'Победа Команды 1', value: `${Math.round(outcomeValues[0])}%` },
         { label: 'Ничья', value: `${Math.round(outcomeValues[1])}%` },
         { label: 'Победа Команды 2', value: `${Math.round(outcomeValues[2])}%` },
+      ],
+      totals: [
+        { label: 'ТБ 1.5', value: `${Math.round(goalDistribution.markets.totals.over15 * 100)}%` },
+        { label: 'ТМ 1.5', value: `${Math.round(goalDistribution.markets.totals.under15 * 100)}%` },
+        { label: 'ТБ 2.5', value: `${Math.round(goalDistribution.markets.totals.over25 * 100)}%` },
+        { label: 'ТМ 2.5', value: `${Math.round(goalDistribution.markets.totals.under25 * 100)}%` },
+        { label: 'ТБ 3.5', value: `${Math.round(goalDistribution.markets.totals.over35 * 100)}%` },
+        { label: 'ТМ 3.5', value: `${Math.round(goalDistribution.markets.totals.under35 * 100)}%` },
+      ],
+      btts: [
+        { label: 'Да', value: `${Math.round(goalDistribution.markets.btts.yes * 100)}%` },
+        { label: 'Нет', value: `${Math.round(goalDistribution.markets.btts.no * 100)}%` },
       ],
     },
     explanation: {
@@ -1476,7 +1489,7 @@ ${JSON.stringify(goalDistributionForLlm)}
       );
     }
 
-    const response = adaptAnalysisContractToResponse(contract, trimmedMatch, researchSources);
+    const response = adaptAnalysisContractToResponse(contract, trimmedMatch, researchSources, goalDistribution);
     const publicProbabilities = response.probabilities.outcomes.map((outcome: { value: string }) => toProbabilityNumber(outcome.value));
     console.log('[ORAKUL DIAGNOSTIC] Public Response probabilities:', `team1=${publicProbabilities[0]} draw=${publicProbabilities[1]} team2=${publicProbabilities[2]}`);
 
