@@ -646,8 +646,11 @@ async function handleHockeyAnalysis(
       const startTime = Date.now();
       let isCompleted = false;
       let lastPollData: any = null;
+      let pollCount = 0;
 
       while (Date.now() - startTime < maxTimeoutMs) {
+        pollCount++;
+        const elapsed = Date.now() - startTime;
         const pollRes = await fetch(`https://api.you.com/v1/research/${taskId}`, {
           method: 'GET',
           headers: {
@@ -656,23 +659,49 @@ async function handleHockeyAnalysis(
           },
         });
 
-        if (pollRes.ok) {
-          lastPollData = await pollRes.ok ? await pollRes.json() : null;
-          const status = String(lastPollData?.status || '').toLowerCase();
-          if (status === 'completed') {
+        const pollOk = pollRes.ok;
+        const pollHttp = pollRes.status;
+        let pollStatus: string | null = null;
+        let pollState: string | null = null;
+        let pollData: any = null;
+
+        if (pollOk) {
+          try {
+            pollData = await pollRes.json();
+          } catch {
+            pollData = null;
+          }
+          lastPollData = pollData;
+          pollStatus = String(pollData?.status || '').toLowerCase() || null;
+          pollState = pollData?.state != null ? String(pollData.state) : null;
+
+          console.log(`[HOCKEY POLL #${pollCount}] elapsed=${elapsed}ms http=${pollHttp} ok=${pollOk} status=${pollStatus} state=${pollState}`);
+
+          if (pollStatus === 'completed') {
             isCompleted = true;
             break;
           }
-          if (status === 'failed' || status === 'error' || status === 'cancelled') {
-            throw new Error(`You.com Research task ${taskId} failed with status: ${status}`);
+          if (pollStatus === 'failed' || pollStatus === 'error' || pollStatus === 'cancelled') {
+            console.log(`[HOCKEY POLL #${pollCount}] terminal status=${pollStatus}`);
+            throw new Error(`You.com Research task ${taskId} failed with status: ${pollStatus}`);
           }
+        } else {
+          console.log(`[HOCKEY POLL #${pollCount}] elapsed=${elapsed}ms http=${pollHttp} ok=${pollOk}`);
         }
         await new Promise((r) => setTimeout(r, pollingIntervalMs));
       }
 
       if (!isCompleted) {
+        const lastStatus = lastPollData?.status ? String(lastPollData.status).toLowerCase() : null;
+        const lastState = lastPollData?.state != null ? String(lastPollData.state) : null;
+        console.log(`[HOCKEY POLL TIMEOUT] polls=${pollCount} elapsed=${Date.now() - startTime}ms lastStatus=${lastStatus} lastState=${lastState}`);
         throw new Error(`You.com Research polling timed out for task ${taskId}`);
       }
+
+      const finalStatus = lastPollData?.status ? String(lastPollData.status).toLowerCase() : null;
+      const finalState = lastPollData?.state != null ? String(lastPollData.state) : null;
+      const hasResult = !!(lastPollData?.result || lastPollData?.output || lastPollData?.content);
+      console.log(`[HOCKEY POLL DONE] status=${finalStatus} state=${finalState} hasResult=${hasResult} resultKeys=${lastPollData?.result ? Object.keys(lastPollData.result).join(',') : 'none'}`);
 
       const rawReport = lastPollData?.result?.output?.content || lastPollData?.result?.content || lastPollData?.output || '';
       const normReport = normalizeResearchReport(rawReport);
