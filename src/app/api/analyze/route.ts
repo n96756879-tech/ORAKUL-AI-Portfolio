@@ -1,4 +1,7 @@
 import { NextResponse } from 'next/server';
+import { parseHockeyVDP } from '@/lib/hockey/hockey-vdp-parser';
+import { adaptHockeyVDPToEngineInput } from '@/lib/hockey/hockey-engine-adapter';
+import { predictHockeyMatch } from '@/lib/hockey/hockey-engine';
 import { parseVDP } from '@/lib/vdp-parser';
 import type { ParsedVDP } from '@/lib/vdp-parser';
 import { calculateProbabilities } from '@/lib/probability-engine';
@@ -16,7 +19,8 @@ import {
   getCachedResearch,
   getOrRunResearch,
 } from '@/lib/data';
-import type { DataPack } from '@/lib/data';
+import type { DataPack, ResearchQueryKey } from '@/lib/data';
+import type { AnalysisResult } from '@/types/analysis';
 
 export function buildGoalDistributionInput(vdp: ParsedVDP): GoalDistributionInput {
   const mapTeam = (team: ParsedVDP['team1']) => ({
@@ -499,9 +503,246 @@ function adaptAnalysisContractToResponse(
   };
 }
 
+function buildHockeyResearchQuery(trimmedMatch: string): string {
+  return `Анализ хоккейного матча ${trimmedMatch}. Найди официальную статистику: форма команд (последние 5 матчей с точным счётом в основное время, ОТ/Б), среднее число забитых/пропущенных шайб, броски по воротам (Shots For/Against), штрафное время (PIM), спецбригады Power Play (PP%) и Penalty Kill (PK%), вратари и их статус/процент отраженных бросков (SV%), травмы ключевых игроков и личные встречи. В ответе строго сформируй блок VERIFIED DATA PACK.`;
+}
+
+async function handleHockeyAnalysis(
+  trimmedMatch: string,
+  ydcApiKey: string,
+  keydealerApiKey: string
+) {
+  const researchQuery = buildHockeyResearchQuery(trimmedMatch);
+  const researchCacheKey = buildResearchCacheKey(researchQuery as any);
+  
+  const cachedResearch = getCachedResearch(researchCacheKey);
+  let researchMarkdown = cachedResearch?.report ?? '';
+  let researchSources: ResearchSource[] = cachedResearch?.sources ?? [];
+
+  if (!cachedResearch) {
+    const researchResult = await getOrRunResearch(researchCacheKey, async () => {
+      let taskId: string | null = null;
+      const initRes = await fetch('https://api.you.com/v1/research', {
+        method: 'POST',
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+          'X-API-Key': ydcApiKey,
+        },
+        body: JSON.stringify({
+          input: researchQuery,
+          research_effort: 'deep',
+          background: true,
+        }),
+      });
+
+      if (!initRes.ok) {
+        const rawErrText = await initRes.text();
+        throw new Error(`You.com Research failed: HTTP ${initRes.status} — ${sanitizeSecrets(rawErrText)}`);
+      }
+
+      const initData = await initRes.json();
+      taskId = initData.task_id || initData.taskId || initData.id || null;
+      if (!taskId) {
+        throw new Error('You.com Research init failed: task_id was missing');
+      }
+
+      const pollingIntervalMs = 5_000;
+      const maxTimeoutMs = 180_000;
+      const startTime = Date.now();
+      let isCompleted = false;
+      let lastPollData: any = null;
+
+      while (Date.now() - startTime < maxTimeoutMs) {
+        const pollRes = await fetch(`https://api.you.com/v1/research/${taskId}`, {
+          method: 'GET',
+          headers: {
+            'Accept': 'application/json',
+            'X-API-Key': ydcApiKey,
+          },
+        });
+
+        if (pollRes.ok) {
+          lastPollData = await pollRes.ok ? await pollRes.json() : null;
+          const status = String(lastPollData?.status || '').toLowerCase();
+          if (status === 'completed') {
+            isCompleted = true;
+            break;
+          }
+          if (status === 'failed' || status === 'error' || status === 'cancelled') {
+            throw new Error(`You.com Research task ${taskId} failed with status: ${status}`);
+          }
+        }
+        await new Promise((r) => setTimeout(r, pollingIntervalMs));
+      }
+
+      if (!isCompleted) {
+        throw new Error(`You.com Research polling timed out for task ${taskId}`);
+      }
+
+      const rawReport = lastPollData?.result?.output?.content || lastPollData?.result?.content || lastPollData?.output || '';
+      const normReport = normalizeResearchReport(rawReport);
+
+      const rawSources = lastPollData?.result?.sources || lastPollData?.sources || [];
+      const sources: ResearchSource[] = Array.isArray(rawSources)
+        ? rawSources.map((s: any) => ({
+            name: s.title || s.name || s.url || 'Источник You.com Research',
+            url: s.url || s.link || '',
+          })).filter((s: ResearchSource) => s.url)
+        : [];
+
+      return { report: normReport, sources };
+    });
+
+    researchMarkdown = researchResult.report;
+    researchSources = researchResult.sources;
+  }
+
+  const rawVdpText = extractVDP(researchMarkdown);
+  const parsedHockeyVdp = parseHockeyVDP(rawVdpText);
+  const engineInput = adaptHockeyVDPToEngineInput(parsedHockeyVdp);
+  const predictionResult = predictHockeyMatch(engineInput);
+
+  // Authoritative Hockey probabilities from Hockey Engine
+  const regProbs = {
+    team1: predictionResult.core.pHomeRegulationWin,
+    draw: predictionResult.core.pRegulationTie,
+    team2: predictionResult.core.pAwayRegulationWin,
+  };
+  const finalProbs = {
+    team1: predictionResult.core.pHomeFinalWin,
+    team2: predictionResult.core.pAwayFinalWin,
+  };
+
+  // Construct Hockey LLM prompt focusing on hockey metrics
+  const hockeySystemPrompt = `Ты — профессиональный спортивно-аналитический и статистический ассистент ORAKUL AI для ХОККЕЯ.
+Твоя задача — изучить отчёт исследований You.com и сгенерировать глубокий, строгий текстовый разбор хоккейного матча.
+
+ПРАВИЛА:
+1. Выдавай ТОЛЬКО валидный JSON без внешнего текста или markdown-блоков (или с тиками \`\`\`json).
+2. Числовые вероятности вычисляются авторитарным математическим движком ORAKUL Hockey Engine и будут установлены автоматически.
+3. Твоя задача — качественная текстовая аналитика на основе VERIFIED DATA PACK.
+
+JSON SCHEMA:
+{
+  "match": "${trimmedMatch}",
+  "explanation": {
+    "overview": "Краткое введение и контекст матча...",
+    "team1Form": "Анализ формы первой команды (броски, спецбригады, вратарь)...",
+    "team2Form": "Анализ формы второй команды (броски, спецбригады, вратарь)...",
+    "h2h": "История личных встреч...",
+    "squadAndInjuries": "Вратари, составы, ключевые травмированные...",
+    "factors": ["Фактор 1", "Фактор 2", "Фактор 3", "Фактор 4"]
+  },
+  "usedSources": [
+    { "name": "Источник", "url": "https://..." }
+  ]
+}`;
+
+  const truncatedReport = truncateResearchReport(researchMarkdown);
+  const userPrompt = `МАТЧ: ${trimmedMatch}
+
+ДАННЫЕ ИССЛЕДОВАНИЯ YOU.COM:
+${truncatedReport}`;
+
+  let contract: Record<string, any> | null = null;
+  for (let llmAttempt = 0; llmAttempt < 2; llmAttempt++) {
+    try {
+      const chatRes = await fetch('https://api.keydealer.net/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${keydealerApiKey}`,
+        },
+        body: JSON.stringify({
+          model: 'anthropic/claude-3.5-sonnet',
+          messages: [
+            { role: 'system', content: hockeySystemPrompt },
+            { role: 'user', content: userPrompt },
+          ],
+          temperature: 0.2,
+        }),
+      });
+
+      if (!chatRes.ok) {
+        throw new Error(`KeyDealer API HTTP error: ${chatRes.status}`);
+      }
+
+      const chatData = await chatRes.json();
+      const rawContent = chatData?.choices?.[0]?.message?.content || '';
+      const cleanedJson = String(rawContent)
+        .replace(/^```json\s*/i, '')
+        .replace(/^```\s*/i, '')
+        .replace(/```$/i, '')
+        .trim();
+
+      const parsed = JSON.parse(cleanedJson);
+      contract = buildAnalysisContract(parsed);
+      if (contract) break;
+    } catch (parseError: any) {
+      console.error('JSON parse error from Hockey LLM:', parseError);
+    }
+  }
+
+  // Fallback text if LLM failed
+  if (!contract) {
+    contract = {
+      match: trimmedMatch,
+      explanation: {
+        overview: `Анализ хоккейного матча ${trimmedMatch} сформирован ORAKUL Hockey Engine.`,
+        team1Form: 'Статистика первой команды учтена движком.',
+        team2Form: 'Статистика второй команды учтена движком.',
+        h2h: 'Данные личных встреч обработаны.',
+        squadAndInjuries: 'Информация по вратарям и составам учтена.',
+        factors: ['Форма в последних матчах', 'Статистика спецбригад PP/PK', 'Надёжность вратарей'],
+      },
+      usedSources: [],
+    };
+  }
+
+  // Format outcomes for UI compatibility:
+  // Primary outcomes show 2-way Final OT/SO probabilities as key market, plus 3-way Regulation in labels/details if needed.
+  // We provide outcomes representing Final Winner (incl. OT/SO) and Regulation 1X2 in clear label format.
+  const outcomeValues = [
+    { label: `Победа 1 (с ОТ/Б)`, value: `${Math.round(finalProbs.team1 * 100)}%` },
+    { label: `Победа 2 (с ОТ/Б)`, value: `${Math.round(finalProbs.team2 * 100)}%` },
+    { label: `Основное время: П1 ${Math.round(regProbs.team1 * 100)}% | X ${Math.round(regProbs.draw * 100)}% | П2 ${Math.round(regProbs.team2 * 100)}%`, value: '1X2' }
+  ];
+
+  const explanation = contract.explanation || {};
+  const rawFactors = extractLegacyFactors(explanation);
+  const factors = rawFactors.length >= 3 ? rawFactors.slice(0, 5) : [
+    'Форма в последних матчах',
+    'Эффективность спецбригад (PP/PK)',
+    'Стабильность вратарской линии'
+  ];
+
+  const responseBody: AnalysisResult = {
+    status: 'success',
+    match: {
+      title: contract.match || trimmedMatch,
+      meta: 'Анализ на основе исследования You.com Research и ORAKUL Hockey Engine',
+    },
+    probabilities: {
+      outcomes: outcomeValues,
+    },
+    explanation: {
+      overview: toTrimmedString(explanation.overview),
+      team1Form: toTrimmedString(explanation.team1Form),
+      team2Form: toTrimmedString(explanation.team2Form),
+      h2h: toTrimmedString(explanation.h2h),
+      squadAndInjuries: toTrimmedString(explanation.squadAndInjuries),
+      factors: Array.isArray(factors) ? factors.join('\n') : toTrimmedString(factors),
+    },
+    usedSources: normalizeUsedSources(contract.usedSources, researchSources),
+  };
+
+  return NextResponse.json(responseBody);
+}
+
 export async function POST(req: Request) {
   try {
-    const { match } = await req.json();
+    const { match, sport = 'football' } = await req.json();
 
     if (!match || typeof match !== 'string' || match.trim().length === 0) {
       return NextResponse.json(
@@ -526,6 +767,10 @@ export async function POST(req: Request) {
         { error: 'KeyDealer API key is not configured in .env' },
         { status: 500 }
       );
+    }
+
+    if (sport === 'hockey') {
+      return await handleHockeyAnalysis(trimmedMatch, ydcApiKey, keydealerApiKey);
     }
 
     const currentDateStr = '2026 год';
