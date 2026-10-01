@@ -577,9 +577,9 @@ function parseRecentFormSection(
     if (lot !== null) lossesOT = lot;
     const lso = parseNumber(findFieldValueInBlock(summaryBlockText, ['SO LOSSES', 'SO_LOSSES']));
     if (lso !== null) lossesSO = lso;
-    const gf = parseNumber(findFieldValueInBlock(summaryBlockText, ['GOALS FOR', 'GOALS_FOR']));
+    const gf = parseNumber(findFieldValueInBlock(summaryBlockText, ['GOALS FOR', 'GOALS_FOR', 'GOALSFOR']));
     if (gf !== null) goalsForTotal = gf;
-    const ga = parseNumber(findFieldValueInBlock(summaryBlockText, ['GOALS AGAINST', 'GOALS_AGAINST']));
+    const ga = parseNumber(findFieldValueInBlock(summaryBlockText, ['GOALS AGAINST', 'GOALS_AGAINST', 'GOALSAGAINST']));
     if (ga !== null) goalsAgainstTotal = ga;
   } else {
     for (const m of matches) {
