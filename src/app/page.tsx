@@ -35,6 +35,7 @@ interface AnalysisResult {
 
 export default function Home() {
   const [matchInput, setMatchInput] = useState('');
+  const [sport, setSport] = useState<'football' | 'hockey'>('football');
   const [loadingState, setLoadingState] = useState<'idle' | 'searching' | 'analyzing'>('idle');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [result, setResult] = useState<AnalysisResult | null>(null);
@@ -64,7 +65,7 @@ export default function Home() {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ match: matchInput.trim() }),
+        body: JSON.stringify({ match: matchInput.trim(), sport }),
       });
 
       clearTimeout(searchTimer);
@@ -127,12 +128,32 @@ export default function Home() {
 
         {/* Input Form */}
         <form onSubmit={handleAnalyze} className="w-full mb-8">
+          <div className="flex gap-2 mb-2">
+            <button
+              type="button"
+              onClick={() => setSport('football')}
+              className={`px-4 py-1.5 rounded-full text-xs font-mono uppercase tracking-wider transition-all ${
+                sport === 'football' ? 'bg-cyan-900 border border-cyan-500 text-cyan-200' : 'bg-slate-800 border border-slate-700 text-slate-400'
+              }`}
+            >
+              Football
+            </button>
+            <button
+              type="button"
+              onClick={() => setSport('hockey')}
+              className={`px-4 py-1.5 rounded-full text-xs font-mono uppercase tracking-wider transition-all ${
+                sport === 'hockey' ? 'bg-indigo-900 border border-indigo-500 text-indigo-200' : 'bg-slate-800 border border-slate-700 text-slate-400'
+              }`}
+            >
+              Hockey
+            </button>
+          </div>
           <div className="relative group">
             <input
               type="text"
               value={matchInput}
               onChange={(e) => setMatchInput(e.target.value)}
-              placeholder="Россия — Португалия"
+              placeholder={sport === 'football' ? "Россия — Португалия" : "Торонто — Монреаль"}
               disabled={loadingState !== 'idle'}
               className="w-full bg-slate-900/80 backdrop-blur-xl text-slate-100 placeholder-slate-500 text-lg sm:text-xl font-medium px-6 py-5 rounded-2xl border border-slate-800 focus:border-cyan-500/80 focus:outline-none focus:ring-4 focus:ring-cyan-500/10 transition-all shadow-2xl disabled:opacity-60"
             />
@@ -142,7 +163,7 @@ export default function Home() {
               disabled={loadingState !== 'idle' || !matchInput.trim()}
               className="mt-4 w-full sm:w-auto sm:absolute sm:right-3 sm:top-3 sm:mt-0 bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-white font-semibold text-base px-8 py-3.5 rounded-xl shadow-lg shadow-cyan-500/20 transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
             >
-              <span>✨ Анализировать матч</span>
+              <span>✨ Анализировать {sport === 'football' ? 'матч' : 'игру'}</span>
             </button>
           </div>
 

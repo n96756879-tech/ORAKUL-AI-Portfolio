@@ -504,7 +504,101 @@ function adaptAnalysisContractToResponse(
 }
 
 function buildHockeyResearchQuery(trimmedMatch: string): string {
-  return `Анализ хоккейного матча ${trimmedMatch}. Найди официальную статистику: форма команд (последние 5 матчей с точным счётом в основное время, ОТ/Б), среднее число забитых/пропущенных шайб, броски по воротам (Shots For/Against), штрафное время (PIM), спецбригады Power Play (PP%) и Penalty Kill (PK%), вратари и их статус/процент отраженных бросков (SV%), травмы ключевых игроков и личные встречи. В ответе строго сформируй блок VERIFIED DATA PACK.`;
+  return `Проведи глубокое независимое спортивно-статистическое исследование хоккейного матча "${trimmedMatch}".
+
+Ты создаёшь внутренний проверенный пакет данных (VERIFIED DATA PACK) для математического движка ORAKUL Hockey Engine. Отдавай приоритет официальным первичным источникам (КХЛ, НХЛ, официальные сайты клубов).
+
+В ответе ОБЯЗАТЕЛЬНО должна содержаться буквально строка:
+# VERIFIED DATA PACK
+
+Категорически запрещено заменять VERIFIED DATA PACK обычной текстовой или аналитической статьёй. Отчёт ДОЛЖЕН содержать строго следующие структурированные секции:
+
+## 1. MATCH IDENTIFICATION
+FACT: [Команда 1] vs [Команда 2]
+DATE: [Дата матча]
+LEAGUE: [Лига/Турнир]
+VENUE: [Арена/Город]
+HOME_AWAY: [Команда 1] — HOME; [Команда 2] — AWAY (или наоборот)
+
+## 2. TEAM 1 RECENT FORM — [Название Команды 1]
+### FORM SUMMARY
+GAMES PLAYED: [Число сыгранных матчей, обычно 5]
+REGULATION WINS: [Победы в основное время]
+REGULATION LOSSES: [Поражения в основное время]
+OT LOSSES: [Поражения в овертайме]
+SO LOSSES: [Поражения по буллитам]
+GOALS FOR: [Заброшено шайб всего]
+GOALS AGAINST: [Пропущено шайб всего]
+
+- MATCH 1: [Дата] | [Соперник] | [Счёт, напр. 4:1] | [W или L] | GF: [Голы] | GA: [Пропущено] | [REGULATION/OVERTIME/SHOOTOUT]
+- MATCH 2: [Дата] | [Соперник] | [Счёт] | [W или L] | GF: [Голы] | GA: [Пропущено] | [REGULATION/OVERTIME/SHOOTOUT]
+- MATCH 3: [Дата] | [Соперник] | [Счёт] | [W или L] | GF: [Голы] | GA: [Пропущено] | [REGULATION/OVERTIME/SHOOTOUT]
+- MATCH 4: [Дата] | [Соперник] | [Счёт] | [W или L] | GF: [Голы] | GA: [Пропущено] | [REGULATION/OVERTIME/SHOOTOUT]
+- MATCH 5: [Дата] | [Соперник] | [Счёт] | [W или L] | GF: [Голы] | GA: [Пропущено] | [REGULATION/OVERTIME/SHOOTOUT]
+
+## 3. TEAM 2 RECENT FORM — [Название Команды 2]
+### FORM SUMMARY
+GAMES PLAYED: [Число сыгранных матчей, обычно 5]
+REGULATION WINS: [Победы в основное время]
+REGULATION LOSSES: [Поражения в основное время]
+OT LOSSES: [Поражения в овертайме]
+SO LOSSES: [Поражения по буллитам]
+GOALS FOR: [Заброшено шайб всего]
+GOALS AGAINST: [Пропущено шайб всего]
+
+- MATCH 1: [Дата] | [Соперник] | [Счёт] | [W или L] | GF: [Голы] | GA: [Пропущено] | [REGULATION/OVERTIME/SHOOTOUT]
+- MATCH 2: [Дата] | [Соперник] | [Счёт] | [W или L] | GF: [Голы] | GA: [Пропущено] | [REGULATION/OVERTIME/SHOOTOUT]
+- MATCH 3: [Дата] | [Соперник] | [Счёт] | [W или L] | GF: [Голы] | GA: [Пропущено] | [REGULATION/OVERTIME/SHOOTOUT]
+- MATCH 4: [Дата] | [Соперник] | [Счёт] | [W или L] | GF: [Голы] | GA: [Пропущено] | [REGULATION/OVERTIME/SHOOTOUT]
+- MATCH 5: [Дата] | [Соперник] | [Счёт] | [W или L] | GF: [Голы] | GA: [Пропущено] | [REGULATION/OVERTIME/SHOOTOUT]
+
+## 4. GOALTENDING
+### TEAM 1
+STARTER: [Имя вратаря] | STATUS: [CONFIRMED/PARTIALLY_CONFIRMED/UNCONFIRMED]
+SV_PCT: [Процент отраженных бросков, напр. 0.925]
+GAA: [Коэффициент надежности, напр. 2.15]
+BACKUP: [Имя запасного вратаря]
+
+### TEAM 2
+STARTER: [Имя вратаря] | STATUS: [CONFIRMED/PARTIALLY_CONFIRMED/UNCONFIRMED]
+SV_PCT: [Процент отраженных бросков, напр. 0.910]
+GAA: [Коэффициент надежности, напр. 2.50]
+BACKUP: [Имя запасного вратаря]
+
+## 5. SPECIAL TEAMS
+### TEAM 1
+PP_PCT: [Процент реализации большинства, напр. 22.5%]
+PK_PCT: [Процент нейтрализации меньшинства, напр. 82.0%]
+
+### TEAM 2
+PP_PCT: [Процент реализации большинства, напр. 18.0%]
+PK_PCT: [Процент нейтрализации меньшинства, напр. 79.5%]
+
+## 6. SHOTS AND DEFENSE
+### TEAM 1
+SHOTS_FOR_PER_GAME: [Средние броски в створ, напр. 30.5]
+SHOTS_AGAINST_PER_GAME: [Средние броски соперника, напр. 28.0]
+
+### TEAM 2
+SHOTS_FOR_PER_GAME: [Средние броски в створ, напр. 27.0]
+SHOTS_AGAINST_PER_GAME: [Средние броски соперника, напр. 32.0]
+
+## 7. H2H
+- MATCH 1: [Дата] | [Команда 1 — Команда 2] | [Счёт]
+- MATCH 2: [Дата] | [Команда 1 — Команда 2] | [Счёт]
+- MATCH 3: [Дата] | [Команда 1 — Команда 2] | [Счёт]
+
+## 8. AVAILABILITY AND INJURIES
+### TEAM 1
+- PLAYER: [Имя] | STATUS: [OUT/QUESTIONABLE] | REASON: [Травма]
+
+### TEAM 2
+- PLAYER: [Имя] | STATUS: [OUT/QUESTIONABLE] | REASON: [Травма]
+
+ПРАВИЛА ЗАПОЛНЕНИЯ:
+1. Если данное не найдено, пиши NOT_FOUND или UNKNOWN. Не придумывай факты и счет.
+2. Не превращай отсутствующие данные в 0.
+3. Соблюдай точность названий полей. Строка "# VERIFIED DATA PACK" обязательна в самом начале отчёта.`;
 }
 
 async function handleHockeyAnalysis(
@@ -599,6 +693,14 @@ async function handleHockeyAnalysis(
   }
 
   const rawVdpText = extractVDP(researchMarkdown);
+  if (!rawVdpText || rawVdpText.trim().length === 0) {
+    console.error('[ORAKUL HOCKEY] VERIFIED DATA PACK not found in research report. Aborting analysis.');
+    return NextResponse.json(
+      { error: 'VERIFIED DATA PACK не найден в отчёте исследования. Анализ невозможен.' },
+      { status: 422 }
+    );
+  }
+
   const parsedHockeyVdp = parseHockeyVDP(rawVdpText);
   const engineInput = adaptHockeyVDPToEngineInput(parsedHockeyVdp);
   const predictionResult = predictHockeyMatch(engineInput);
