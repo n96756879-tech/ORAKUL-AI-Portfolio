@@ -395,4 +395,53 @@ Turkey beat Italy
     assert.equal(parsed.h2h[0].winner, 'Turkey');
     assert.equal(parsed.h2h[1].winner, 'DRAW');
   });
+
+  test('T13: aggregate H2H FACT parses concrete meetings with null date/competition', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** Barcelona vs Real Madrid
+
+## H2H
+- **FACT:** Barcelona 4–3 Real Madrid; Barcelona 3–2 Real Madrid aet; Real Madrid 2–5 Barcelona; Real Madrid 0–4 Barcelona; Real Madrid 3–2 Barcelona; Real Madrid 4–1 Barcelona.
+- **DATE:** 14.01.2024–11.05.2025
+- **TOURNAMENT:** LaLiga, Copa del Rey, Supercopa de España
+- **STATUS:** PARTIALLY_CONFIRMED
+`);
+
+    assert.equal(parsed.h2h.length, 6);
+    assert.deepEqual(parsed.h2h.map((e) => e.score), ['4-3', '3-2', '2-5', '0-4', '3-2', '4-1']);
+    assert.deepEqual(parsed.h2h.map((e) => e.winner), ['Barcelona', 'Barcelona', 'Barcelona', 'Barcelona', 'Real Madrid', 'Real Madrid']);
+    assert.ok(parsed.h2h.every((e) => e.date === null));
+    assert.ok(parsed.h2h.every((e) => e.competition === null));
+  });
+
+  test('T14: aggregate H2H FACT draw -> winner DRAW', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** Team A vs Team B
+
+## H2H
+- **FACT:** Team A 2–2 Team B
+`);
+
+    assert.equal(parsed.h2h.length, 1);
+    assert.equal(parsed.h2h[0].score, '2-2');
+    assert.equal(parsed.h2h[0].winner, 'DRAW');
+    assert.equal(parsed.h2h[0].date, null);
+  });
+
+  test('T15: aggregate FACT outside H2H section is not parsed', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** Barcelona vs Real Madrid
+
+## FORM SUMMARY
+- **FACT:** Barcelona 3–1 Real Madrid; Barcelona 2–0 Real Madrid
+`);
+
+    assert.equal(parsed.h2h.length, 0);
+  });
 });

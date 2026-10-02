@@ -354,6 +354,117 @@ function normalizeTeamName(name: string): string {
   return name.toLocaleLowerCase().replace(/[üÜ]/g, "u").replace(/[^a-z0-9а-яё]/gi, "");
 }
 
+// Суффиксы, отбрасываемые при сопоставлении имён («Barcelona» == «FC Barcelona»).
+const TEAM_SUFFIX_TOKENS = new Set(["fc", "sc", "cf", "afc", "national", "team"]);
+
+// Нормализация для сопоставления пары команд в aggregate H2H FACT.
+// Отбрасываем распространённые суффиксы (FC/SC/etc.), чтобы «Barcelona» == «FC Barcelona».
+function normalizeTeamNameForPair(name: string): string {
+  return name
+    .toLocaleLowerCase()
+    .replace(/[üÜ]/g, "u")
+    .replace(/[^a-z0-9а-яё]+/gi, " ")
+    .split(/\s+/)
+    .filter((t) => t.length > 0 && !TEAM_SUFFIX_TOKENS.has(t))
+    .join(" ");
+}
+
+function resolvePairTeam(
+  raw: string,
+  team1: string,
+  team2: string,
+): { normalized: string; isTeam1: boolean; isTeam2: boolean } {
+  const normalized = normalizeTeamNameForPair(raw);
+  const t1 = normalizeTeamNameForPair(team1);
+  const t2 = normalizeTeamNameForPair(team2);
+  return {
+    normalized,
+    isTeam1: normalized.length > 0 && normalized === t1,
+    isTeam2: normalized.length > 0 && normalized === t2,
+  };
+}
+
+// Aggregate H2H FACT fallback: разбирает строку вида
+//   FACT: Barcelona 4–3 Real Madrid; Barcelona 3–2 Real Madrid aet; ...
+// внутри распознанной H2H-секции. Каждая под-встреча добавляется только если
+// обе команды соответствуют team1/team2 и извлечён score.
+// Даты/соревнования из aggregate-заголовка не переносятся в отдельные встречи.
+function parseH2HAggregateFacts(lines: string[], team1: string | null, team2: string | null): ParsedH2H[] {
+  if (!team1 || !team2) return [];
+  const entries: ParsedH2H[] = [];
+  const factRe = /^\s*[-*]?\s*FACT\s*:\s*(.+)$/i;
+
+  for (const rawLine of lines) {
+    const line = stripMd(rawLine);
+    const m = line.match(factRe);
+    if (!m) continue;
+    const fact = m[1].trim().replace(/[.;]$/, "");
+    if (!fact) continue;
+    // Разбиваем FACT по ';' на отдельные встречи.
+    const parts = fact.split(/\s*;\s*/);
+    for (const part of parts) {
+      const chunk = part.trim();
+      if (!chunk) continue;
+      const pair = parseAggregateMeeting(chunk, team1, team2);
+      if (pair) entries.push(pair);
+    }
+  }
+
+  // Дедупликация aggregate-встреч по score+winner (все даты null,
+  // поэтому внешняя deduplicateH2H по date|score схлопнула бы разные встречи
+  // с одинаковым счётом, например «3-2» в обе стороны).
+  const seen = new Set<string>();
+  return entries.filter((entry) => {
+    const key = `${entry.score?.replace(/\s+/g, '').replace(/[–—]/g, '-') || ''}|${entry.winner || ''}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function parseAggregateMeeting(chunk: string, team1: string, team2: string): ParsedH2H | null {
+  // «aet» может стоять в конце всей под-встречи (после имени команды) или сразу после счёта.
+  const cleaned = chunk.replace(/\s*(?:aet|AET)\s*$/, "");
+  // Находим счёт: «N–M» или «N-M» или «N:M».
+  const scoreIdx = cleaned.search(/\d{1,2}\s*[–—\-:]\s*\d{1,2}/);
+  if (scoreIdx < 0) return null;
+
+  const before = cleaned.slice(0, scoreIdx).trim();
+  const after = cleaned.slice(scoreIdx).replace(/\d{1,2}\s*[–—\-:]\s*\d{1,2}\s*/, "").trim();
+
+  const scoreToken = cleaned.slice(scoreIdx).match(/\d{1,2}\s*[–—\-:]\s*\d{1,2}/)?.[0] ?? "";
+  const scoreParts = scoreToken.split(/[–—\-:]/);
+  if (scoreParts.length < 2) return null;
+  const home = Number(scoreParts[0].trim());
+  const away = Number(scoreParts[1].trim());
+  if (isNaN(home) || isNaN(away)) return null;
+
+  const left = resolvePairTeam(before, team1, team2);
+  const right = resolvePairTeam(after, team1, team2);
+
+  if (!left.normalized || !right.normalized) return null;
+  if (left.normalized === right.normalized) return null;
+  if (!(left.isTeam1 || left.isTeam2) || !(right.isTeam1 || right.isTeam2)) return null;
+  if ((left.isTeam1 && right.isTeam1) || (left.isTeam2 && right.isTeam2)) return null;
+
+  const isLeftTeam1 = left.isTeam1;
+  let winner: string;
+  if (home === away) {
+    winner = "DRAW";
+  } else {
+    winner = home > away ? (isLeftTeam1 ? team1 : team2) : (isLeftTeam1 ? team2 : team1);
+  }
+
+  return {
+    date: null,
+    competition: null,
+    score: `${home}-${away}`,
+    winner,
+    source: null,
+    status: null,
+  };
+}
+
 function parseH2HPlain(lines: string[], team1: string | null, team2: string | null): ParsedH2H[] {
   if (!team1 || !team2) return [];
   const expected = [normalizeTeamName(team1), normalizeTeamName(team2)];
@@ -513,6 +624,8 @@ function parseH2H(sections: Map<string, string[]>, team1: string | null, team2: 
         if (plain.length > 0) return deduplicateH2H(plain);
         const bullets = parseH2HBullets(lines);
         if (bullets.length > 0) return deduplicateH2H(bullets);
+        const aggregate = parseH2HAggregateFacts(lines, team1, team2);
+        if (aggregate.length > 0) return aggregate;
       }
     }
   }
