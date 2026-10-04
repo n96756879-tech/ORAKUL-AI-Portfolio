@@ -466,8 +466,13 @@ function parseAggregateMeeting(chunk: string, team1: string, team2: string): Par
   const away = Number(scoreParts[1].trim());
   if (isNaN(home) || isNaN(away)) return null;
 
-  const left = resolvePairTeam(before, team1, team2);
-  const right = resolvePairTeam(after, team1, team2);
+  // Убираем только хвостовой date-like parenthetical suffix после команды:
+  // «Denmark (OCT 2023)» → «Denmark». Не трогаем скобки внутри имени.
+  const stripTrailingDateSuffix = (s: string): string =>
+    s.replace(/\s*\((?:\d{1,2}\s+)?[A-Za-z]{3,}\.?\s*\d{0,4}\)\s*$/u, "").trim();
+
+  const left = resolvePairTeam(stripTrailingDateSuffix(before), team1, team2);
+  const right = resolvePairTeam(stripTrailingDateSuffix(after), team1, team2);
 
   if (!left.normalized || !right.normalized) return null;
   if (left.normalized === right.normalized) return null;
@@ -789,6 +794,15 @@ function extractTeamNamesFromFormHeaders(report: string): { team1: string | null
   };
 }
 
+// Длинный summary-FACT вида «FACT: Wales last five official matches: ...» не является
+// именем команды. Определяем по префиксу FACT: или по наличию summary-признаков.
+function isSummaryFactName(name: string | null): boolean {
+  if (!name) return true;
+  const s = name.trim();
+  if (/^FACT\s*:/i.test(s)) return true;
+  return /last\s+(?:five|5|\d+)\s+/i.test(s) || /\bGF\s*\d/i.test(s) || /\bGD\s*[+\-]?\d/i.test(s);
+}
+
 export function parseVDP(report: string): ParsedVDP {
   const sections = splitIntoSections(report);
 
@@ -811,6 +825,16 @@ export function parseVDP(report: string): ParsedVDP {
     const fromTitle = extractTeamNameFromMatchTitle(report);
     if (!team1.teamName && fromTitle.team1) team1.teamName = fromTitle.team1;
     if (!team2.teamName && fromTitle.team2) team2.teamName = fromTitle.team2;
+  }
+
+  // Если имя команды так и не найдено или подставлен summary-FACT
+  // («FACT: Wales last five ...»), берём identity из corroborated MATCH home/away bridge.
+  if (isSummaryFactName(team1.teamName) || isSummaryFactName(team2.teamName)) {
+    const bridge = extractH2HBridge(sections);
+    if (bridge) {
+      if (isSummaryFactName(team1.teamName)) team1.teamName = bridge.team1Side;
+      if (isSummaryFactName(team2.teamName)) team2.teamName = bridge.team2Side;
+    }
   }
 
   const h2h = parseH2H(sections, team1.teamName, team2.teamName);

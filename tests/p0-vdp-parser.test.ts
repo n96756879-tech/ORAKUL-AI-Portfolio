@@ -578,4 +578,43 @@ Turkey beat Italy
 
     assert.deepEqual(parsed.h2h.map((e) => e.winner), ['GERMANY']);
   });
+
+  test('T23: summary FACT is not a team name — identity from MATCH bridge', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** Wales vs Denmark, 04.10.2026, 19:45 BST, UEFA Nations League 2026/27, League A Group A4, Matchday 4, Cardiff City Stadium; Wales home, Denmark away.
+
+## TEAM 1 FORM
+- **FACT:** Wales last five official matches: W-L-L-D-W; 2 wins, 1 draw, 2 losses; GF 10, GA 6, GD +4.
+
+## TEAM 2 FORM
+- **FACT:** Denmark last five official matches: L-W-L-D-W; 2 wins, 1 draw, 2 losses; GF 12, GA 9, GD +3.
+`);
+
+    assert.equal(parsed.team1.teamName, 'Wales');
+    assert.equal(parsed.team2.teamName, 'Denmark');
+    assert.ok(!/FACT:/i.test(parsed.team1.teamName!));
+    assert.ok(!/FACT:/i.test(parsed.team2.teamName!));
+    assert.ok(!/last four|last five|official matches/i.test(parsed.team1.teamName!));
+    assert.ok(!/last four|last five|official matches/i.test(parsed.team2.teamName!));
+  });
+
+  test('T24: aggregate H2H with trailing date parenthetical parses all meetings', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** Wales vs Denmark; Wales home, Denmark away.
+
+## H2H
+- **FACT:** Wales 0-1 Denmark (OCT 2023)
+- **FACT:** Wales 1-3 Denmark (JUN 2022)
+- **FACT:** Denmark 2-0 Wales (SEP 2021)
+- **FACT:** Wales 2-2 Denmark (NOV 2020)
+`);
+
+    assert.equal(parsed.h2h.length, 4);
+    assert.deepEqual(parsed.h2h.map((e) => e.score), ['0-1', '1-3', '2-0', '2-2']);
+    assert.deepEqual(parsed.h2h.map((e) => e.winner), ['Denmark', 'Denmark', 'Denmark', 'DRAW']);
+  });
 });
