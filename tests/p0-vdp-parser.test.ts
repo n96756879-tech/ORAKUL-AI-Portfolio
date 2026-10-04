@@ -444,4 +444,138 @@ Turkey beat Italy
 
     assert.equal(parsed.h2h.length, 0);
   });
+
+  test('T16: numbered H2H — English Winner: and score fallback', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** France vs Spain
+
+## HEAD-TO-HEAD
+1. **14.10.2024 — Friendly:** France 1–0 Spain. **Winner:** France.
+2. **10.09.2024 — Friendly:** France 2–2 Spain. **Winner:** draw.
+3. **26.03.2024 — Friendly:** Spain 2–1 France. **Winner:** Spain.
+4. **06.09.2019 — Friendly:** France 0–3 Spain.
+`);
+
+    assert.equal(parsed.h2h.length, 4);
+    assert.deepEqual(parsed.h2h.map((e) => e.winner), ['FRANCE', 'DRAW', 'SPAIN', 'SPAIN']);
+  });
+
+  test('T17: numbered H2H — Russian победитель inline (not score fallback)', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** Франция vs Испания
+
+## HEAD-TO-HEAD
+1. **14.10.2024 — Товарищеский:** Франция 1–2 Испания. победитель: Франция.
+`);
+
+    assert.equal(parsed.h2h.length, 1);
+    assert.equal(parsed.h2h[0].winner, 'ФРАНЦИЯ');
+  });
+
+  test('T18: ### H2H n — unequal SCORE без WINNER -> winner из score', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** France vs Spain
+
+## H2H
+### H2H 1
+- **DATE:** 14.11.2024
+- **TOURNAMENT:** Cup
+- **SCORE:** 1-0
+`);
+
+    assert.equal(parsed.h2h.length, 1);
+    assert.equal(parsed.h2h[0].winner, 'FRANCE');
+    assert.equal(parsed.h2h[0].date, '14.11.2024');
+    assert.equal(parsed.h2h[0].competition, 'Cup');
+  });
+
+  test('T19: bullet H2H — unequal SCORE без WINNER -> winner из score', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** France vs Spain
+
+## H2H
+- **FACT:** France 0-3 Spain
+- **DATE:** 10.10.2024
+- **SCORE:** 0-3
+`);
+
+    assert.equal(parsed.h2h.length, 1);
+    assert.equal(parsed.h2h[0].winner, 'SPAIN');
+    assert.equal(parsed.h2h[0].date, '10.10.2024');
+  });
+
+  test('T20: D-14 mixed-script winner canonicalized via corroborated MATCH home/away bridge', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** Netherlands vs Germany, UEFA Nations League; Netherlands home, Germany away.
+
+# TEAM 1 — RECENT FORM: НИДЕРЛАНДЫ
+### MATCH 1
+- **SCORE:** 2-0
+
+# TEAM 2 — RECENT FORM: ГЕРМАНИЯ
+### MATCH 1
+- **SCORE:** 0-2
+
+## H2H
+1. **14.10.2024 — Friendly:** Germany 1–0 Netherlands. **Winner:** Germany.
+2. **10.09.2024 — Friendly:** Netherlands 0–0 Germany. **Winner:** draw.
+3. **26.03.2024 — Friendly:** Netherlands 2–1 Germany. **Winner:** Netherlands.
+`);
+
+    assert.equal(parsed.team1.teamName, 'НИДЕРЛАНДЫ');
+    assert.equal(parsed.team2.teamName, 'ГЕРМАНИЯ');
+    assert.deepEqual(parsed.h2h.map((e) => e.winner), ['ГЕРМАНИЯ', 'DRAW', 'НИДЕРЛАНДЫ']);
+  });
+
+  test('T21: D-14 no canonicalization without corroborating home/away clause', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** Netherlands vs Germany, UEFA Nations League.
+
+# TEAM 1 — RECENT FORM: НИДЕРЛАНДЫ
+### MATCH 1
+- **SCORE:** 2-0
+
+# TEAM 2 — RECENT FORM: ГЕРМАНИЯ
+### MATCH 1
+- **SCORE:** 0-2
+
+## H2H
+1. **14.10.2024 — Friendly:** Germany 1–0 Netherlands. **Winner:** Germany.
+`);
+
+    assert.deepEqual(parsed.h2h.map((e) => e.winner), ['GERMANY']);
+  });
+
+  test('T22: D-14 no canonicalization when home/away disagrees with vs-order', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** Netherlands vs Germany, UEFA Nations League; Germany home, Netherlands away.
+
+# TEAM 1 — RECENT FORM: НИДЕРЛАНДЫ
+### MATCH 1
+- **SCORE:** 2-0
+
+# TEAM 2 — RECENT FORM: ГЕРМАНИЯ
+### MATCH 1
+- **SCORE:** 0-2
+
+## H2H
+1. **14.10.2024 — Friendly:** Germany 1–0 Netherlands. **Winner:** Germany.
+`);
+
+    assert.deepEqual(parsed.h2h.map((e) => e.winner), ['GERMANY']);
+  });
 });

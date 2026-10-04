@@ -84,9 +84,13 @@ function parseScore(raw: string): { goalsFor: number | null; goalsAgainst: numbe
   return { goalsFor: null, goalsAgainst: null, penaltyShootout };
 }
 
+function normalizeToken(raw: string): string {
+  return raw.trim().replace(/\.+$/, "").toUpperCase();
+}
+
 function parseResult(raw: string | null): "W" | "D" | "L" | "UNKNOWN" {
   if (!raw) return "UNKNOWN";
-  const r = raw.trim().toUpperCase();
+  const r = normalizeToken(raw);
   if (r === "W") return "W";
   if (r === "D") return "D";
   if (r === "L") return "L";
@@ -95,7 +99,7 @@ function parseResult(raw: string | null): "W" | "D" | "L" | "UNKNOWN" {
 
 function parseVenue(raw: string | null): "HOME" | "AWAY" | "NEUTRAL" | "UNKNOWN" {
   if (!raw) return "UNKNOWN";
-  const r = raw.trim().toUpperCase();
+  const r = normalizeToken(raw);
   if (r === "HOME" || r === "H") return "HOME";
   if (r === "AWAY" || r === "A") return "AWAY";
   if (r === "NEUTRAL" || r === "N") return "NEUTRAL";
@@ -104,7 +108,7 @@ function parseVenue(raw: string | null): "HOME" | "AWAY" | "NEUTRAL" | "UNKNOWN"
 
 function parseOpponentStrength(raw: string | null): "STRONG" | "MEDIUM" | "WEAK" | "UNKNOWN" {
   if (!raw) return "UNKNOWN";
-  const r = raw.trim().toUpperCase();
+  const r = normalizeToken(raw);
   if (r === "STRONG") return "STRONG";
   if (r === "MEDIUM") return "MEDIUM";
   if (r === "WEAK") return "WEAK";
@@ -307,14 +311,16 @@ function parseTeam(sections: Map<string, string[]>, teamFormPattern: RegExp): Pa
   return { teamName, matches, form };
 }
 
-function parseH2HNumbered(lines: string[]): ParsedH2H[] {
+function parseH2HNumbered(lines: string[], team1: string | null, team2: string | null, bridge: H2HBridge | null = null): ParsedH2H[] {
   const entries: ParsedH2H[] = [];
   const entryRe = /^\s*\d+\.\s+\*{0,2}(\d{2}\.\d{2}\.\d{4})\s*(?:[—–\-\u0442\u0410\u0424]|\u0442\u0410[\u0424\u0423])\s*(.+?)\*{0,2}\s*$/;
   const winnerRe = /победитель\s*(?:[—–\-]|\u0442\u0410[\u0424\u0423])\s*([^.;]+)/i;
   const tournamentRe = /^[^;]+/;
+  const inlineWinnerRe = /(?:победитель|winner)\s*:?\s*([^.;]+)/i;
 
   for (let i = 0; i < lines.length; i++) {
-    const m = stripMd(lines[i]).match(entryRe);
+    const stripped = stripMd(lines[i]);
+    const m = stripped.match(entryRe);
     if (!m) continue;
     const date = m[1];
     const rest = m[2].trim();
@@ -326,14 +332,18 @@ function parseH2HNumbered(lines: string[]): ParsedH2H[] {
     let source: string | null = null;
     let status: string | null = null;
 
-    const next = lines[i + 1] ? stripMd(lines[i + 1]) : '';
-    if (next) {
-      const wm = next.match(winnerRe);
-      if (wm) winner = wm[1].trim().replace(/\.$/, '');
-      const tm = next.match(tournamentRe);
-      if (tm) {
-        const t = tm[0].replace(/^[Тт]урнир\s*:\s*/i, '').replace(/;.*$/, '').trim();
-        if (t) competition = t;
+    const iwm = stripped.match(inlineWinnerRe);
+    if (iwm) winner = iwm[1].trim().replace(/\.$/, '');
+    if (!winner) {
+      const next = lines[i + 1] ? stripMd(lines[i + 1]) : '';
+      if (next) {
+        const wm = next.match(winnerRe);
+        if (wm) winner = wm[1].trim().replace(/\.$/, '');
+        const tm = next.match(tournamentRe);
+        if (tm) {
+          const t = tm[0].replace(/^[Тт]урнир\s*:\s*/i, '').replace(/;.*$/, '').trim();
+          if (t) competition = t;
+        }
       }
     }
 
@@ -343,8 +353,25 @@ function parseH2HNumbered(lines: string[]): ParsedH2H[] {
       if (/^(?:CONFIDENCE|STATUS)\s*:/i.test(sl)) status = sl.replace(/^(?:CONFIDENCE|STATUS)\s*:\s*/i, '').trim();
     }
 
+    const up = winner?.trim().toUpperCase();
+    if (up === 'DRAW' || up === 'NO WINNER' || /^(?:НИЧЬЯ|НИЧЕЙ|НИЧЁТ\b)/i.test(up ?? '')) winner = 'DRAW';
+    else if (winner) winner = up ?? null;
+
+    if (!winner && score && team1 && team2) {
+      const parts = score.split(/[–-]/).map((s) => Number(s.trim()));
+      if (parts.length === 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
+        if (parts[0] === parts[1]) winner = 'DRAW';
+        else winner = (parts[0] > parts[1] ? team1 : team2).toUpperCase();
+      }
+    }
+
     if (isConcreteH2H(date, score)) {
-      entries.push({ date, competition, score, winner: normalizeH2HWinner(score, winner), source, status });
+      const normalizedWinner = normalizeH2HWinner(score, winner);
+      entries.push({
+        date, competition, score,
+        winner: canonicalizeH2HWinner(normalizedWinner, bridge, team1, team2),
+        source, status,
+      });
     }
   }
   return entries;
@@ -507,7 +534,7 @@ function parseH2HPlain(lines: string[], team1: string | null, team2: string | nu
   return entries;
 }
 
-function parseH2HBullets(lines: string[]): ParsedH2H[] {
+function parseH2HBullets(lines: string[], team1: string | null, team2: string | null, bridge: H2HBridge | null = null): ParsedH2H[] {
   const entries: ParsedH2H[] = [];
   // regexes work after stripMd (which removes ** and leading #); support -/* list markers
   const factRe = /^\s*[-*]?\s*FACT\s*:\s*(.+)$/i;
@@ -542,8 +569,21 @@ function parseH2HBullets(lines: string[]): ParsedH2H[] {
       // stop if we hit a new header or empty gap after a few lines
       if (/^#{1,6}\s/.test(lines[j]) || (/^\s*$/.test(lines[j]) && j > i + 3)) break;
     }
+    if (!winner && score && team1 && team2) {
+      const parts = score.split(/[–-]/).map((s) => Number(s.trim()));
+      if (parts.length === 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
+        if (parts[0] === parts[1]) winner = 'DRAW';
+        else winner = (parts[0] > parts[1] ? team1 : team2).toUpperCase();
+      }
+    }
+
     if (isConcreteH2H(date, score)) {
-      entries.push({ date, competition, score, winner: normalizeH2HWinner(score, winner), source, status });
+      const normalizedWinner = normalizeH2HWinner(score, winner);
+      entries.push({
+        date, competition, score,
+        winner: canonicalizeH2HWinner(normalizedWinner, bridge, team1, team2),
+        source, status,
+      });
     }
     i++;
   }
@@ -566,6 +606,72 @@ function normalizeH2HWinner(score: string | null, winner: string | null): string
   return winner;
 }
 
+// D-14: conditional cross-script identity bridge for H2H winners.
+// Uses the "## MATCH" FACT (e.g. "Netherlands vs Germany; Netherlands home, Germany away")
+// as the ONLY local, non-guessing link between H2H-side names and TEAM 1 / TEAM 2 identities.
+// Side attribution is accepted only when BOTH the vs-order (left=team1, right=team2) AND the
+// corroborating home/away clause agree. Otherwise returns null and no canonicalization happens.
+type H2HBridge = { team1Side: string; team2Side: string };
+
+function bridgeSideKey(name: string): string {
+  return name
+    .toLocaleLowerCase()
+    .replace(/[üÜ]/g, "u")
+    .replace(/[^a-z0-9а-яё]+/gi, " ")
+    .trim();
+}
+
+function extractH2HBridge(sections: Map<string, string[]>): H2HBridge | null {
+  let matchLines: string[] | undefined;
+  for (const [key, lines] of sections) {
+    if (key.trim().toUpperCase() === "MATCH") { matchLines = lines; break; }
+  }
+  if (!matchLines) return null;
+
+  for (const raw of matchLines) {
+    const s = stripMd(raw);
+    const fm = s.match(/FACT\s*:\s*(.+)$/i);
+    if (!fm) continue;
+    const fact = fm[1].replace(/\*/g, "").trim();
+
+    const vsMatch = fact.match(/^([\s\S]+?)\s+vs\.?\s+([\s\S]+)$/i);
+    if (!vsMatch) continue;
+    const left = vsMatch[1].split(/[:;]/).pop()!.trim();
+    const right = vsMatch[2].split(/[,;]/)[0].trim();
+    if (!left || !right) continue;
+    if (bridgeSideKey(left) === bridgeSideKey(right)) continue;
+
+    const homeMatch = fact.match(/([\p{L}][\p{L}.'\- ]*?)\s+(?:is\s+)?home\b/iu);
+    const awayMatch = fact.match(/([\p{L}][\p{L}.'\- ]*?)\s+(?:is\s+)?away\b/iu);
+    if (!homeMatch || !awayMatch) continue;
+    const home = homeMatch[1].split(/[,;:]/).pop()!.trim();
+    const away = awayMatch[1].split(/[,;:]/).pop()!.trim();
+
+    // Unambiguous only when vs-order and home/away clause agree (left=home=team1, right=away=team2).
+    if (bridgeSideKey(home) !== bridgeSideKey(left)) continue;
+    if (bridgeSideKey(away) !== bridgeSideKey(right)) continue;
+
+    return { team1Side: left, team2Side: right };
+  }
+  return null;
+}
+
+function canonicalizeH2HWinner(
+  winner: string | null,
+  bridge: H2HBridge | null,
+  team1: string | null,
+  team2: string | null,
+): string | null {
+  if (!winner || !bridge || !team1 || !team2) return winner;
+  const up = winner.trim().toUpperCase();
+  if (up === "DRAW" || up === "D" || up === "NO WINNER" || /^НИЧ/iu.test(up)) return winner;
+  const key = bridgeSideKey(winner);
+  if (!key) return winner;
+  if (key === bridgeSideKey(bridge.team1Side)) return team1.toUpperCase();
+  if (key === bridgeSideKey(bridge.team2Side)) return team2.toUpperCase();
+  return winner;
+}
+
 function deduplicateH2H(entries: ParsedH2H[]): ParsedH2H[] {
   const seen = new Set<string>();
   return entries.filter((entry) => {
@@ -579,6 +685,7 @@ function deduplicateH2H(entries: ParsedH2H[]): ParsedH2H[] {
 
 function parseH2H(sections: Map<string, string[]>, team1: string | null, team2: string | null): ParsedH2H[] {
   const entries: ParsedH2H[] = [];
+  const bridge = extractH2HBridge(sections);
 
   for (let i = 1; i <= 5; i++) {
     const matchKey = `MATCH ${i}`;
@@ -597,7 +704,14 @@ function parseH2H(sections: Map<string, string[]>, team1: string | null, team2: 
       const source = getField(ml, "SOURCE");
       const status = getField(ml, "STATUS");
        if (isConcreteH2H(date, score)) {
-        entries.push({ date, competition, score, winner: normalizeH2HWinner(score, winner), source, status });
+        let resolvedWinner = normalizeH2HWinner(score, winner);
+        if (!resolvedWinner && team1 && team2) {
+          const parts = score ? score.split(/[–-]/).map((s) => Number(s.trim())) : [];
+          if (parts.length === 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
+            resolvedWinner = parts[0] === parts[1] ? 'DRAW' : (parts[0] > parts[1] ? team1 : team2).toUpperCase();
+          }
+        }
+        entries.push({ date, competition, score, winner: resolvedWinner, source, status });
       }
     }
   }
@@ -606,7 +720,7 @@ function parseH2H(sections: Map<string, string[]>, team1: string | null, team2: 
 
   for (const [key, lines] of sections) {
     if (/^H2H:HEAD[-\s]?TO[-\s]?HEAD$/i.test(key)) {
-      const numbered = parseH2HNumbered(lines);
+      const numbered = parseH2HNumbered(lines, team1, team2, bridge);
       if (numbered.length > 0) return deduplicateH2H(numbered);
     }
   }
@@ -618,11 +732,11 @@ function parseH2H(sections: Map<string, string[]>, team1: string | null, team2: 
       const isH2HKey = /^(?:.*:)?H2H$/.test(up) || /^(?:.*:)?HEAD([-. ]?TO[-. ]?HEAD)?$/.test(up) || /HEAD-TO-HEAD/.test(up);
       if (isH2HKey) {
         // try numbered first (for ### 1. style under it)
-        const numbered = parseH2HNumbered(lines);
+        const numbered = parseH2HNumbered(lines, team1, team2, bridge);
         if (numbered.length > 0) return deduplicateH2H(numbered);
         const plain = parseH2HPlain(lines, team1, team2);
         if (plain.length > 0) return deduplicateH2H(plain);
-        const bullets = parseH2HBullets(lines);
+        const bullets = parseH2HBullets(lines, team1, team2, bridge);
         if (bullets.length > 0) return deduplicateH2H(bullets);
         const aggregate = parseH2HAggregateFacts(lines, team1, team2);
         if (aggregate.length > 0) return aggregate;
