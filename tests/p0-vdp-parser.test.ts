@@ -617,4 +617,42 @@ Turkey beat Italy
     assert.deepEqual(parsed.h2h.map((e) => e.score), ['0-1', '1-3', '2-0', '2-2']);
     assert.deepEqual(parsed.h2h.map((e) => e.winner), ['Denmark', 'Denmark', 'Denmark', 'DRAW']);
   });
+
+  test('T25: D-23 summary-FACT identity recovered from MATCH section WITHOUT H2H', () => {
+    // Ireland–Israel production shape: H2H отсутствует, но в MATCH есть однозначная пара.
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** Ireland vs Israel, UEFA Nations League, 04.10.2026.
+
+## TEAM 1 - RECENT FORM: FACT: Ireland last five official matches: D-W-L-D-W; 2W 2D 1L; GF10 GA7 GD+3
+
+## TEAM 2 - RECENT FORM: FACT: Israel last five official matches: D-L-L-W-W; 2W 1D 2L; GF6 GA7 GD-1
+`);
+
+    assert.equal(parsed.team1.teamName, 'Ireland');
+    assert.equal(parsed.team2.teamName, 'Israel');
+    assert.ok(!/FACT:/i.test(parsed.team1.teamName!));
+    assert.ok(!/FACT:/i.test(parsed.team2.teamName!));
+    assert.ok(!/last five|official matches/i.test(parsed.team1.teamName!));
+    assert.ok(!/last five|official matches/i.test(parsed.team2.teamName!));
+  });
+
+  test('T26: D-23 summary-FACT with no recoverable identity -> null, not summary FACT', () => {
+    // MATCH FACT не содержит однозначного "A vs B" → имя не придумываем.
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** kickoff at 18:45 UTC.
+
+## TEAM 1 - RECENT FORM: FACT: Ireland last five official matches: D-W-L-D-W; GF10 GA7 GD+3
+
+## TEAM 2 - RECENT FORM: FACT: Israel last five official matches: D-L-L-W-W; GF6 GA7 GD-1
+`);
+
+    assert.equal(parsed.team1.teamName, null);
+    assert.equal(parsed.team2.teamName, null);
+    assert.ok(!/FACT:/i.test(String(parsed.team1.teamName)));
+    assert.ok(!/FACT:/i.test(String(parsed.team2.teamName)));
+  });
 });

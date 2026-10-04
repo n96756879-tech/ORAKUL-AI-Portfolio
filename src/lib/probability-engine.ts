@@ -94,14 +94,15 @@ function h2hScore(h2h: ParsedVDP["h2h"], team1Name: string | null): number {
 
 // Venue: если team1 играет дома — бонус, если в гостях — штраф.
 // NEUTRAL и UNKNOWN = 0.
+// Парсер и VDP-контракт гарантируют: MATCH 1 — самый свежий матч команды.
+// Поэтому venue текущего матча берётся из ПЕРВОГО элемента массива (MATCH 1),
+// а не из последнего (MATCH 5 = самый старый).
 function venueAdjustment(team1Matches: ParsedMatch[], team2Matches: ParsedMatch[]): number {
-  // Определяем venue по последнему матчу каждой команды как прокси.
-  // Если у team1 последний матч HOME → team1 хозяин текущего матча.
-  const lastT1 = team1Matches[team1Matches.length - 1];
-  const lastT2 = team2Matches[team2Matches.length - 1];
+  const latestT1 = team1Matches[0];
+  const latestT2 = team2Matches[0];
 
-  if (lastT1?.venue === "HOME" && lastT2?.venue === "AWAY") return 0.08;
-  if (lastT1?.venue === "AWAY" && lastT2?.venue === "HOME") return -0.08;
+  if (latestT1?.venue === "HOME" && latestT2?.venue === "AWAY") return 0.08;
+  if (latestT1?.venue === "AWAY" && latestT2?.venue === "HOME") return -0.08;
   return 0;
 }
 

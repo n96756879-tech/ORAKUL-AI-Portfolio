@@ -784,6 +784,27 @@ function extractTeamNamesFromPreamble(sections: Map<string, string[]>): { team1:
   return { team1: getField(lines, "TEAM 1"), team2: getField(lines, "TEAM 2") };
 }
 
+// Identity fallback из секции MATCH: разбирает "- **FACT:** Team1 vs Team2 ..."
+// тем же vs-сплитом, что и extractTeamNameFromMatchTitle. Не требует H2H и не
+// гадает: если в MATCH нет однозначного "A vs B", возвращает null для обеих сторон.
+function extractTeamNamesFromMatchSection(sections: Map<string, string[]>): { team1: string | null; team2: string | null } {
+  let matchLines: string[] | undefined;
+  for (const [key, lines] of sections) {
+    if (key.trim().toUpperCase() === "MATCH") { matchLines = lines; break; }
+  }
+  if (!matchLines) return { team1: null, team2: null };
+  for (const raw of matchLines) {
+    const fm = stripMd(raw).match(/FACT\s*:\s*(.+)$/i);
+    if (!fm) continue;
+    const fact = fm[1].replace(/\*/g, "").split(/[;,]/)[0].trim();
+    const vs = fact.split(/\s*(?:vs\.?|—|-|–)\s*/i);
+    if (vs.length >= 2 && vs[0].trim() && vs[1].trim()) {
+      return { team1: vs[0].trim(), team2: vs[1].trim() };
+    }
+  }
+  return { team1: null, team2: null };
+}
+
 function extractTeamNamesFromFormHeaders(report: string): { team1: string | null; team2: string | null } {
   // support "TEAM 1 — RECENT FORM: NAME", "TEAM 1 FORM — NAME", "TEAM 1 FORM: NAME"
   const t1 = report.match(/^#{1,6}\s*TEAM\s*1\s*(?:[-–—]\s*RECENT\s*FORM\s*:\s*|FORM\s*[-–—:]\s*)(.+)$/im);
@@ -836,6 +857,20 @@ export function parseVDP(report: string): ParsedVDP {
       if (isSummaryFactName(team2.teamName)) team2.teamName = bridge.team2Side;
     }
   }
+
+  // Последний безопасный fallback: identity из секции MATCH ("A vs B").
+  // Нужен, когда H2H отсутствует и extractH2HBridge не сработал, но MATCH FACT
+  // содержит однозначную пару. Summary-FACT как teamName недопустим.
+  if (isSummaryFactName(team1.teamName) || isSummaryFactName(team2.teamName)) {
+    const fromMatch = extractTeamNamesFromMatchSection(sections);
+    if (isSummaryFactName(team1.teamName) && fromMatch.team1) team1.teamName = fromMatch.team1;
+    if (isSummaryFactName(team2.teamName) && fromMatch.team2) team2.teamName = fromMatch.team2;
+  }
+
+  // Если валидное имя так и не получено — не придумываем и не оставляем summary-FACT
+  // в качестве teamName: используем null (штатный тип контракта ParsedTeam.teamName).
+  if (isSummaryFactName(team1.teamName)) team1.teamName = null;
+  if (isSummaryFactName(team2.teamName)) team2.teamName = null;
 
   const h2h = parseH2H(sections, team1.teamName, team2.teamName);
 

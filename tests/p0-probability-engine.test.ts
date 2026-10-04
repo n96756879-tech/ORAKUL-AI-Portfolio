@@ -189,4 +189,45 @@ describe('P0 Probability Engine — formScore excludes UNKNOWN from denominator'
     const r = calculateProbabilities(parsed);
     assert.deepEqual(r, { team1: 48, draw: 19, team2: 33 });
   });
+
+  test('R5: venueAdjustment берёт venue из MATCH 1 (самый свежий), не из MATCH 5', () => {
+    // Асимметричный fixture: team1 заведомо сильнее (W vs L), чтобы venue-сдвиг
+    // знака не «съедался» округлением. Меняем ТОЛЬКО venue в MATCH 1 / MATCH 5.
+    const build = (m1t1: string, m1t2: string, m5t1 = 'NEUTRAL', m5t2 = 'NEUTRAL') => {
+      const t1 = [
+        matchBlock(1, '2026-09-20', 'O', m1t1, '3-0', 'W'),
+        matchBlock(2, '2026-09-13', 'O', 'NEUTRAL', '3-0', 'W'),
+        matchBlock(3, '2026-09-06', 'O', 'NEUTRAL', '3-0', 'W'),
+        matchBlock(4, '2026-08-30', 'O', 'NEUTRAL', '3-0', 'W'),
+        matchBlock(5, '2026-08-23', 'O', m5t1, '3-0', 'W'),
+      ];
+      const t2 = [
+        matchBlock(1, '2026-09-19', 'O', m1t2, '0-3', 'L'),
+        matchBlock(2, '2026-09-12', 'O', 'NEUTRAL', '0-3', 'L'),
+        matchBlock(3, '2026-09-05', 'O', 'NEUTRAL', '0-3', 'L'),
+        matchBlock(4, '2026-08-29', 'O', 'NEUTRAL', '0-3', 'L'),
+        matchBlock(5, '2026-08-22', 'O', m5t2, '0-3', 'L'),
+      ];
+      const raw = `# VERIFIED DATA PACK\n\n## MATCH\n\n- **FACT:** Team A vs Team B, League, 04.10.2026\n\n## TEAM 1 FORM\n- **FACT:** Team A\n\n${t1.join('\n\n')}\n\n## TEAM 2 FORM\n- **FACT:** Team B\n\n${t2.join('\n\n')}\n`;
+      return calculateProbabilities(parseVDP(raw));
+    };
+
+    // MATCH 1 = HOME/AWAY → team1 получает venue-бонус.
+    const homeFirst = build('HOME', 'AWAY');
+    // MATCH 1 = AWAY/HOME → team1 получает venue-штраф.
+    const awayFirst = build('AWAY', 'HOME');
+    // MATCH 1 = NEUTRAL, а противоположный MATCH 5 = HOME/AWAY (должен игнорироваться).
+    const neutralFirst = build('NEUTRAL', 'NEUTRAL', 'HOME', 'AWAY');
+
+    assert.deepEqual(homeFirst, { team1: 70, draw: 13, team2: 17 });
+    assert.deepEqual(awayFirst, { team1: 68, draw: 13, team2: 19 });
+    // MATCH 5 = HOME/AWAY не влияет: результат совпадает с полностью нейтральным MATCH 1/5.
+    assert.deepEqual(neutralFirst, { team1: 69, draw: 13, team2: 18 });
+
+    // Ключевое доказательство: источник venue — MATCH 1.
+    assert.ok(homeFirst.team1 > neutralFirst.team1, 'MATCH1 HOME должен дать team1 больше нейтрали');
+    assert.ok(awayFirst.team1 < neutralFirst.team1, 'MATCH1 AWAY должен дать team1 меньше нейтрали');
+    // Старое (ошибочное) поведение читало MATCH 5 → homeFirst и awayFirst совпали бы.
+    assert.notDeepEqual(homeFirst, awayFirst);
+  });
 });
