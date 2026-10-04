@@ -3,7 +3,9 @@
 // сознательно фиксируются КАК ЕСТЬ.
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { calculateProbabilities } from '../src/lib/probability-engine';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { calculateProbabilities, formScore } from '../src/lib/probability-engine';
 import { parseVDP } from '../src/lib/vdp-parser';
 import {
   buildFullVdp,
@@ -127,5 +129,64 @@ ${t2.join('\n\n')}
     assert.ok(rH2hB.team2 > rNo.team2, `team2 with H2H favoring B (${rH2hB.team2}) must be > without H2H (${rNo.team2})`);
     assert.equal(rNo.team1 + rNo.draw + rNo.team2, 100);
     assert.equal(rH2hB.team1 + rH2hB.draw + rH2hB.team2, 100);
+  });
+});
+
+describe('P0 Probability Engine — formScore excludes UNKNOWN from denominator', () => {
+  // Собирает VDP с заданными результатами для TEAM 1 / TEAM 2.
+  const vdpWithResults = (t1: string[], t2: string[]): string => {
+    const block = (prefix: string, results: string[]) =>
+      results
+        .map((r, i) => `### ${prefix} MATCH ${i + 1}\n${matchBlock(i + 1, '01.01.2025', 'Opponent', 'HOME', '1-0', r)}`)
+        .join('\n');
+    return `# VERIFIED DATA PACK\n\n## TEAM 1 FORM\n- **FACT:** Team A\n\n${block('TEAM 1', t1)}\n\n## TEAM 2 FORM\n- **FACT:** Team B\n\n${block('TEAM 2', t2)}\n`;
+  };
+
+  test('R1: команда только с UNKNOWN результатами -> нейтральный 0.5', () => {
+    const parsed = parseVDP(vdpWithResults(['UNKNOWN', 'UNKNOWN'], ['UNKNOWN', 'UNKNOWN']));
+    // Ни одного известного W/D/L → нейтральный fallback.
+    assert.equal(formScore(parsed.team1), 0.5);
+    assert.equal(formScore(parsed.team2), 0.5);
+  });
+
+  test('R2: UNKNOWN исключён из denominator — точная арифметика', () => {
+    // Team A: W,W,D,UNKNOWN → known=3, points=7 → 7/9
+    // Team B: W,D,D,UNKNOWN → known=3, points=5 → 5/9
+    const parsed = parseVDP(
+      vdpWithResults(['W', 'W', 'D', 'UNKNOWN'], ['W', 'D', 'D', 'UNKNOWN'])
+    );
+    // Старое (ошибочное) поведение дало бы 7/12 и 5/12.
+    assert.equal(formScore(parsed.team1), 7 / 9);
+    assert.equal(formScore(parsed.team2), 5 / 9);
+    assert.notEqual(formScore(parsed.team1), 7 / 12);
+    assert.notEqual(formScore(parsed.team2), 5 / 12);
+  });
+
+  test('R3: Netherlands–Germany fixture — формы 8/12 и 7/12 и Engine 39/22/39', () => {
+    const raw = readFileSync(fileURLToPath(new URL('../real-vdp-sample.txt', import.meta.url)), 'utf8');
+    const parsed = parseVDP(raw);
+
+    assert.equal(parsed.team1.form.wins, 2);
+    assert.equal(parsed.team1.form.draws, 2);
+    assert.equal(parsed.team1.form.losses, 0);
+    assert.equal(parsed.team2.form.wins, 2);
+    assert.equal(parsed.team2.form.draws, 1);
+    assert.equal(parsed.team2.form.losses, 1);
+
+    // known=4 у обеих (пятый матч — UNKNOWN): 8/12 и 7/12.
+    assert.equal(formScore(parsed.team1), 8 / 12);
+    assert.equal(formScore(parsed.team2), 7 / 12);
+
+    const r = calculateProbabilities(parsed);
+    assert.deepEqual(r, { team1: 39, draw: 22, team2: 39 });
+  });
+
+  test('R4: fixture без UNKNOWN сохраняет прежний результат', () => {
+    const parsed = parseVDP(buildFullVdp());
+    // Регрессия: без UNKNOWN знаменатель не меняется, поэтому вывод прежний.
+    assert.equal(formScore(parsed.team1), 10 / 15);
+    assert.equal(formScore(parsed.team2), 7 / 15);
+    const r = calculateProbabilities(parsed);
+    assert.deepEqual(r, { team1: 48, draw: 19, team2: 33 });
   });
 });

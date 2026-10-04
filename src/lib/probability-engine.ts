@@ -28,16 +28,18 @@ function clamp(v: number, min: number, max: number): number {
 }
 
 // Очки за форму: W=3, D=1, L=0. Нормализуется в [0,1].
-function formScore(team: ParsedTeam): number {
-  const matches = team.matches;
-  if (matches.length === 0) return 0.5;
+// UNKNOWN-результаты исключаются из знаменателя: они не должны разбавлять форму.
+export function formScore(team: ParsedTeam): number {
+  const knownMatches = team.matches.filter(
+    (m) => m.result === "W" || m.result === "D" || m.result === "L"
+  );
+  if (knownMatches.length === 0) return 0.5;
   let points = 0;
-  for (const m of matches) {
+  for (const m of knownMatches) {
     if (m.result === "W") points += 3;
     else if (m.result === "D") points += 1;
   }
-  const maxPoints = matches.length * 3;
-  return points / maxPoints;
+  return points / (knownMatches.length * 3);
 }
 
 // Очки за голы: goalDifference нормализуется относительно числа матчей.
