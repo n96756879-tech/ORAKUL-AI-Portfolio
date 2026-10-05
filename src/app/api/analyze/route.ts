@@ -22,8 +22,21 @@ import {
 import type { DataPack, ResearchQueryKey } from '@/lib/data';
 import type { AnalysisResult } from '@/types/analysis';
 
+// Venue текущего матча в перспективе конкретной команды: team1 = currentVenue как есть,
+// team2 = зеркало (HOME ↔ AWAY). NEUTRAL/UNKNOWN остаются без изменений.
+function mirrorVenue(
+  venue: ParsedVDP['currentVenue'],
+): ParsedVDP['currentVenue'] {
+  if (venue === 'HOME') return 'AWAY';
+  if (venue === 'AWAY') return 'HOME';
+  return venue;
+}
+
 export function buildGoalDistributionInput(vdp: ParsedVDP): GoalDistributionInput {
-  const mapTeam = (team: ParsedVDP['team1']) => ({
+  const mapTeam = (
+    team: ParsedVDP['team1'],
+    currentVenue: ParsedVDP['currentVenue'],
+  ) => ({
     matches: team.matches.map((match) => ({
       goalsFor: match.goalsFor ?? undefined,
       goalsAgainst: match.goalsAgainst ?? undefined,
@@ -31,11 +44,12 @@ export function buildGoalDistributionInput(vdp: ParsedVDP): GoalDistributionInpu
       opponentStrength: match.opponentStrength,
       venue: match.venue,
     })),
+    currentVenue,
   });
 
   return {
-    team1: mapTeam(vdp.team1),
-    team2: mapTeam(vdp.team2),
+    team1: mapTeam(vdp.team1, vdp.currentVenue),
+    team2: mapTeam(vdp.team2, mirrorVenue(vdp.currentVenue)),
     h2h: vdp.h2h,
   };
 }

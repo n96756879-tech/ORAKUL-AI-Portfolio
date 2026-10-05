@@ -50,6 +50,7 @@ function vdp(partial: Partial<ParsedVDP> = {}): ParsedVDP {
     team1: team('Team A', []),
     team2: team('Team B', []),
     h2h: [],
+    currentVenue: 'UNKNOWN',
     ...partial,
   };
 }

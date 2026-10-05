@@ -1,4 +1,4 @@
-import type { ParsedVDP, ParsedTeam, ParsedMatch } from "./vdp-parser";
+import type { ParsedVDP, ParsedTeam } from "./vdp-parser";
 
 export type ProbabilityResult = {
   team1: number;
@@ -94,15 +94,12 @@ function h2hScore(h2h: ParsedVDP["h2h"], team1Name: string | null): number {
 
 // Venue: если team1 играет дома — бонус, если в гостях — штраф.
 // NEUTRAL и UNKNOWN = 0.
-// Парсер и VDP-контракт гарантируют: MATCH 1 — самый свежий матч команды.
-// Поэтому venue текущего матча берётся из ПЕРВОГО элемента массива (MATCH 1),
-// а не из последнего (MATCH 5 = самый старый).
-function venueAdjustment(team1Matches: ParsedMatch[], team2Matches: ParsedMatch[]): number {
-  const latestT1 = team1Matches[0];
-  const latestT2 = team2Matches[0];
-
-  if (latestT1?.venue === "HOME" && latestT2?.venue === "AWAY") return 0.08;
-  if (latestT1?.venue === "AWAY" && latestT2?.venue === "HOME") return -0.08;
+// Venue берётся из ParsedVDP.currentVenue — venue ТЕКУЩЕГО анализируемого матча,
+// а не из исторического matches[0]. currentVenue задан с точки зрения team1:
+// HOME ⇒ team1 дома (+0.08), AWAY ⇒ team1 в гостях (−0.08).
+function venueAdjustment(currentVenue: "HOME" | "AWAY" | "NEUTRAL" | "UNKNOWN"): number {
+  if (currentVenue === "HOME") return 0.08;
+  if (currentVenue === "AWAY") return -0.08;
   return 0;
 }
 
@@ -182,7 +179,7 @@ export function calculateProbabilities(parsed: ParsedVDP): ProbabilityResult {
   const os1 = opponentStrengthAdjustment(parsed.team1);
   const os2 = opponentStrengthAdjustment(parsed.team2);
   const h2hVal = h2hScore(parsed.h2h, parsed.team1.teamName);
-  const venueAdj = venueAdjustment(parsed.team1.matches, parsed.team2.matches);
+  const venueAdj = venueAdjustment(parsed.currentVenue);
 
   // Сырые очки для team1 и team2 (до нормализации)
   const rawTeam1 =

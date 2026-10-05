@@ -43,6 +43,9 @@ export type ParsedVDP = {
   team1: ParsedTeam;
   team2: ParsedTeam;
   h2h: ParsedH2H[];
+  // Venue анализируемого матча с точки зрения team1 (team1 = HOME ⇒ team1 дома).
+  // Отличается от ParsedMatch.venue (venue исторического матча команды).
+  currentVenue: "HOME" | "AWAY" | "NEUTRAL" | "UNKNOWN";
 };
 
 function stripMd(s: string): string {
@@ -824,6 +827,69 @@ function isSummaryFactName(name: string | null): boolean {
   return /last\s+(?:five|5|\d+)\s+/i.test(s) || /\bGF\s*\d/i.test(s) || /\bGD\s*[+\-]?\d/i.test(s);
 }
 
+// Venue текущего анализируемого матча из секции MATCH ("...; TeamA home, TeamB away").
+// Возвращает venue с точки зрения team1 (HOME ⇒ team1 дома), NEUTRAL, или UNKNOWN.
+// Не использует matches[0] и не подменяет venue названием команды.
+function extractCurrentVenue(
+  sections: Map<string, string[]>,
+  team1Name: string | null,
+  team2Name: string | null,
+): "HOME" | "AWAY" | "NEUTRAL" | "UNKNOWN" {
+  let matchLines: string[] | undefined;
+  for (const [key, lines] of sections) {
+    if (key.trim().toUpperCase() === "MATCH") {
+      matchLines = lines;
+      break;
+    }
+  }
+  if (!matchLines) return "UNKNOWN";
+
+  for (const raw of matchLines) {
+    const s = stripMd(raw);
+    const fm = s.match(/FACT\s*:\s*(.+)$/i);
+    if (!fm) continue;
+    const fact = fm[1].replace(/\*/g, "").trim();
+
+    const homeMatch = fact.match(/([\p{L}][\p{L}.'\- ]*?)\s+(?:is\s+)?home\b/iu);
+    const awayMatch = fact.match(/([\p{L}][\p{L}.'\- ]*?)\s+(?:is\s+)?away\b/iu);
+    if (homeMatch && awayMatch) {
+      const home = homeMatch[1].split(/[,;:]/).pop()!.trim();
+      const away = awayMatch[1].split(/[,;:]/).pop()!.trim();
+      const homeKey = bridgeSideKey(home);
+      const awayKey = bridgeSideKey(away);
+
+      // 1) Сопоставление по именам команд — наиболее надёжный путь.
+      if (homeKey && awayKey) {
+        if (team1Name && bridgeSideKey(team1Name) === homeKey) return "HOME";
+        if (team1Name && bridgeSideKey(team1Name) === awayKey) return "AWAY";
+        if (team2Name && bridgeSideKey(team2Name) === homeKey) return "AWAY";
+        if (team2Name && bridgeSideKey(team2Name) === awayKey) return "HOME";
+      }
+
+      // 2) Позиционный fallback по контракту MATCH-FACT "[Команда 1] vs [Команда 2]"
+      // (тот же vs-порядок, что у extractH2HBridge/extractTeamNamesFromMatchSection).
+      // Нужен, когда имена в FACT и в шапке VDP записаны в разных скриптах
+      // (например, шапка НИДЕРЛАНДЫ, а FACT "Netherlands home, Germany away").
+      const vsMatch = fact.match(/^([\s\S]+?)\s+vs\.?\s+([\s\S]+)$/i);
+      if (vsMatch) {
+        const leftKey = bridgeSideKey(vsMatch[1].split(/[:;]/).pop()!.trim());
+        const rightKey = bridgeSideKey(vsMatch[2].split(/[,;]/)[0].trim());
+        if (leftKey && rightKey) {
+          if (homeKey === leftKey && awayKey === rightKey) return "HOME";
+          if (homeKey === rightKey && awayKey === leftKey) return "AWAY";
+        }
+      }
+
+      // home/away clause есть, но не сопоставлен с team1/team2 → не гадаем.
+      return "UNKNOWN";
+    }
+
+    // Explicit neutral (e.g. "neutral venue") без home/away привязки.
+    if (/\bneutral\b/i.test(fact)) return "NEUTRAL";
+  }
+  return "UNKNOWN";
+}
+
 export function parseVDP(report: string): ParsedVDP {
   const sections = splitIntoSections(report);
 
@@ -873,6 +939,7 @@ export function parseVDP(report: string): ParsedVDP {
   if (isSummaryFactName(team2.teamName)) team2.teamName = null;
 
   const h2h = parseH2H(sections, team1.teamName, team2.teamName);
+  const currentVenue = extractCurrentVenue(sections, team1.teamName, team2.teamName);
 
-  return { team1, team2, h2h };
+  return { team1, team2, h2h, currentVenue };
 }

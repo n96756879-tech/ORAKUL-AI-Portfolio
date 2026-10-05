@@ -207,5 +207,6 @@ export function mergeEngineInput(vdp: ParsedVDP, pack?: DataPack | null): Parsed
     team1: bridgeTeam(vdp.team1, pack),
     team2: bridgeTeam(vdp.team2, pack),
     h2h: bridgeH2H(vdp.h2h, pack),
+    currentVenue: vdp.currentVenue,
   };
 }

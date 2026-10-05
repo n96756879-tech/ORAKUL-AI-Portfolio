@@ -27,6 +27,7 @@ function emptyVdp(): ParsedVDP {
     team1: { teamName: 'Alpha', matches: [], form: { wins: 0, draws: 0, losses: 0, goalsFor: 0, goalsAgainst: 0, goalDifference: 0, resultSequence: [] } },
     team2: { teamName: 'Beta', matches: [], form: { wins: 0, draws: 0, losses: 0, goalsFor: 0, goalsAgainst: 0, goalDifference: 0, resultSequence: [] } },
     h2h: [],
+    currentVenue: 'UNKNOWN',
   };
 }
 

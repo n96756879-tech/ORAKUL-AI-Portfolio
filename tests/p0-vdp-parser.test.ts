@@ -655,4 +655,115 @@ Turkey beat Italy
     assert.ok(!/FACT:/i.test(String(parsed.team1.teamName)));
     assert.ok(!/FACT:/i.test(String(parsed.team2.teamName)));
   });
+
+  test('T27 (A): currentVenue HOME when team1 is home', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** Alpha vs Beta, League, 04.10.2026; Alpha home, Beta away.
+
+## TEAM 1 FORM
+- **FACT:** Alpha
+
+## TEAM 2 FORM
+- **FACT:** Beta
+`);
+    assert.equal(parsed.team1.teamName, 'Alpha');
+    assert.equal(parsed.team2.teamName, 'Beta');
+    assert.equal(parsed.currentVenue, 'HOME');
+  });
+
+  test('T28 (A): cross-script names — positional vs-order still yields HOME', () => {
+    // Реальный кейс Netherlands–Germany: шапка на кириллице, MATCH FACT на латинице.
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** Netherlands vs Germany, 24.09.2026, 20:45, League A; Netherlands home, Germany away.
+
+## TEAM 1 - RECENT FORM: НИДЕРЛАНДЫ
+- **FACT:** form
+
+## TEAM 2 - RECENT FORM: ГЕРМАНИЯ
+- **FACT:** form
+`);
+    assert.equal(parsed.team1.teamName, 'НИДЕРЛАНДЫ');
+    assert.equal(parsed.team2.teamName, 'ГЕРМАНИЯ');
+    assert.equal(parsed.currentVenue, 'HOME');
+  });
+
+  test('T29 (B): currentVenue AWAY when team1 is away (reversed fixture)', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** Alpha vs Beta, League, 04.10.2026; Beta home, Alpha away.
+
+## TEAM 1 FORM
+- **FACT:** Alpha
+
+## TEAM 2 FORM
+- **FACT:** Beta
+`);
+    assert.equal(parsed.currentVenue, 'AWAY');
+  });
+
+  test('T30 (C): explicit neutral venue -> NEUTRAL', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** Alpha vs Beta, League, 04.10.2026; neutral venue.
+
+## TEAM 1 FORM
+- **FACT:** Alpha
+
+## TEAM 2 FORM
+- **FACT:** Beta
+`);
+    assert.equal(parsed.currentVenue, 'NEUTRAL');
+  });
+
+  test('T31 (D): no venue clause -> UNKNOWN (no guessing)', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** Alpha vs Beta, League, 04.10.2026.
+
+## TEAM 1 FORM
+- **FACT:** Alpha
+
+## TEAM 2 FORM
+- **FACT:** Beta
+`);
+    assert.equal(parsed.currentVenue, 'UNKNOWN');
+  });
+
+  test('T32 (D): currentVenue does not fall back to MATCH 1 historical venue', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** Alpha vs Beta, League, 04.10.2026.
+
+## TEAM 1 FORM
+- **FACT:** Alpha
+
+### MATCH 1
+- **DATE:** 2026-09-20
+- **OPPONENT:** O
+- **HOME/AWAY:** HOME
+- **SCORE:** 3-0
+- **RESULT:** W
+
+## TEAM 2 FORM
+- **FACT:** Beta
+
+### MATCH 1
+- **DATE:** 2026-09-19
+- **OPPONENT:** O
+- **HOME/AWAY:** AWAY
+- **SCORE:** 0-3
+- **RESULT:** L
+`);
+    assert.equal(parsed.team1.matches[0]?.venue, 'HOME');
+    assert.equal(parsed.team2.matches[0]?.venue, 'AWAY');
+    assert.equal(parsed.currentVenue, 'UNKNOWN');
+  });
 });

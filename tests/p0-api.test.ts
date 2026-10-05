@@ -203,10 +203,68 @@ describe('P0 API /api/analyze (current behavior)', () => {
       opponentStrength: parsed.team1.matches[0].opponentStrength,
       venue: parsed.team1.matches[0].venue,
     });
-    assert.equal('currentVenue' in input.team1, false);
+    // D-29: currentVenue прокидывается из ParsedVDP (team1) и зеркалится для team2.
+    assert.equal(input.team1.currentVenue, parsed.currentVenue);
     assert.equal('futureOpponentStrength' in input.team1, false);
-    assert.equal('currentVenue' in input.team2, false);
     assert.equal('futureOpponentStrength' in input.team2, false);
+  });
+
+  test('T14b (F): buildGoalDistributionInput зеркалит currentVenue для team2', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** A vs B; A home, B away.
+
+## TEAM 1 FORM
+- **FACT:** A
+
+## TEAM 2 FORM
+- **FACT:** B
+`);
+    assert.equal(parsed.currentVenue, 'HOME');
+    const home = buildGoalDistributionInput(parsed);
+    assert.equal(home.team1.currentVenue, 'HOME');
+    assert.equal(home.team2.currentVenue, 'AWAY');
+
+    const away = buildGoalDistributionInput({ ...parsed, currentVenue: 'AWAY' });
+    assert.equal(away.team1.currentVenue, 'AWAY');
+    assert.equal(away.team2.currentVenue, 'HOME');
+
+    const unknown = buildGoalDistributionInput({ ...parsed, currentVenue: 'UNKNOWN' });
+    assert.equal(unknown.team1.currentVenue, 'UNKNOWN');
+    assert.equal(unknown.team2.currentVenue, 'UNKNOWN');
+  });
+
+  test('T14c (F): GD получает currentVenue и не включает venue-fallback при валидном currentVenue', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** A vs B; A home, B away.
+
+## TEAM 1 FORM
+- **FACT:** A
+
+### MATCH 1
+- **DATE:** 2026-09-20
+- **OPPONENT:** O
+- **HOME/AWAY:** HOME
+- **SCORE:** 3-0
+- **RESULT:** W
+
+### MATCH 2
+- **DATE:** 2026-09-13
+- **OPPONENT:** P
+- **HOME/AWAY:** HOME
+- **SCORE:** 2-0
+- **RESULT:** W
+
+## TEAM 2 FORM
+- **FACT:** B
+`);
+    assert.equal(parsed.currentVenue, 'HOME');
+    const gd = calculateGoalDistribution(buildGoalDistributionInput(parsed));
+    assert.equal(gd.diagnostics.usedFallbacks.includes('team1-venue'), false);
+    assert.equal(gd.diagnostics.usedFallbacks.includes('team2-venue'), true);
   });
 
   test('T15: cache HIT skips Research while Goal Distribution remains local', async () => {
