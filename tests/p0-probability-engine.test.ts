@@ -5,7 +5,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { calculateProbabilities, formScore } from '../src/lib/probability-engine';
+import { calculateProbabilities, calculateProbabilitiesWithTrace, buildEngineTrace, formScore } from '../src/lib/probability-engine';
 import { parseVDP } from '../src/lib/vdp-parser';
 import {
   buildFullVdp,
@@ -229,5 +229,111 @@ describe('P0 Probability Engine — formScore excludes UNKNOWN from denominator'
     // А currentVenue перекрывает противоречащее историческое venue.
     const currentOverridesHist = build('Team A vs Team B; Team B home, Team A away.', 'HOME', 'AWAY');
     assert.deepEqual(currentOverridesHist, awayVenue);
+  });
+});
+
+// D-30: observability-трассировка Probability Engine.
+describe('D-30 Probability Engine diagnostic trace', () => {
+  const traceOf = (raw: string) => buildEngineTrace(parseVDP(raw));
+
+  test('D30-1: trace появляется и содержит ключевые секции/поля', () => {
+    const t = traceOf(buildFullVdp());
+    for (const key of ['input', 'components', 'draw', 'raw', 'normalized'] as const) {
+      assert.ok(key in t, `trace must contain "${key}"`);
+    }
+    for (const key of ['formScore', 'goalScore', 'opponentStrengthAdjustment', 'h2hScore', 'venueAdjustment'] as const) {
+      assert.ok(key in t.components, `components must contain "${key}"`);
+    }
+    for (const key of ['team1', 'team2', 'h2h', 'currentVenue'] as const) {
+      assert.ok(key in t.input, `input must contain "${key}"`);
+    }
+    for (const key of ['base', 'drawRate', 'formDiff', 'h2hDrawRate', 'drawPct'] as const) {
+      assert.ok(key in t.draw, `draw must contain "${key}"`);
+    }
+    for (const key of ['team1', 'team2', 'draw', 'total'] as const) {
+      assert.ok(key in t.raw, `raw must contain "${key}"`);
+    }
+    assert.equal(typeof t.input.team1.teamName, 'string');
+    assert.equal(typeof t.input.team1.matchesUsed, 'number');
+    assert.equal(typeof t.input.team1.knownResults.denominator, 'number');
+    assert.equal(typeof t.input.team1.goalInput.goalDifference, 'number');
+    assert.equal(typeof t.input.team1.opponentStrengthInput.matchesWithStrength, 'number');
+    assert.equal(typeof t.input.h2h.count, 'number');
+    assert.equal(typeof t.normalized.final.team1, 'number');
+  });
+
+  test('D30-2: rawTeam1/rawTeam2 восстанавливаются вручную из компонентов', () => {
+    const t = traceOf(buildFullVdp());
+    const w = t.components.weights;
+    const rebuilt1 =
+      t.components.formScore.team1 * w.recentForm +
+      t.components.goalScore.team1 * w.goals +
+      (0.5 + t.components.opponentStrengthAdjustment.team1) * w.opponentStrength +
+      t.components.h2hScore * w.h2h +
+      (0.5 + t.components.venueAdjustment) * w.venue;
+    const rebuilt2 =
+      t.components.formScore.team2 * w.recentForm +
+      t.components.goalScore.team2 * w.goals +
+      (0.5 + t.components.opponentStrengthAdjustment.team2) * w.opponentStrength +
+      (1 - t.components.h2hScore) * w.h2h +
+      (0.5 - t.components.venueAdjustment) * w.venue;
+    assert.ok(Math.abs(rebuilt1 - t.raw.team1) < 1e-12, `rawTeam1 mismatch: ${rebuilt1} vs ${t.raw.team1}`);
+    assert.ok(Math.abs(rebuilt2 - t.raw.team2) < 1e-12, `rawTeam2 mismatch: ${rebuilt2} vs ${t.raw.team2}`);
+    assert.equal(t.raw.total, t.raw.team1 + t.raw.draw + t.raw.team2);
+  });
+
+  test('D30-3: draw contributions восстанавливают drawPct (с clamp [8,45])', () => {
+    const t = traceOf(buildFullVdp());
+    const d = t.draw;
+    const preClamp = d.base + d.drawRateContribution + d.formDiffContribution + d.h2hDrawContribution;
+    const expected = Math.min(45, Math.max(8, preClamp));
+    assert.ok(Math.abs(expected - d.drawPct) < 1e-12, `drawPct mismatch: ${expected} vs ${d.drawPct}`);
+    if (d.drawRate !== null) {
+      assert.ok(Math.abs((d.drawRate - 0.25) * 30 - d.drawRateContribution) < 1e-12);
+    }
+    if (d.h2hDrawRate !== null) {
+      assert.ok(Math.abs((d.h2hDrawRate - 0.25) * 15 - d.h2hDrawContribution) < 1e-12);
+    }
+  });
+
+  test('D30-4: Engine outputs НЕ изменились (trace.final === calculateProbabilities)', () => {
+    const inputs = [buildFullVdp(), buildIncompleteVdp(1, 1), buildIncompleteVdp(5, 5), buildEmptyFormsVdp(), ''];
+    for (const raw of inputs) {
+      const parsed = parseVDP(raw);
+      const plain = calculateProbabilities(parsed);
+      const traced = calculateProbabilitiesWithTrace(parsed);
+      assert.deepEqual(traced.result, plain);
+      assert.deepEqual(traced.trace.normalized.final, plain);
+    }
+  });
+
+  test('D30-5: currentVenue D-29 логика сохранена (team1 HOME, team2 AWAY)', () => {
+    const raw = `# VERIFIED DATA PACK\n\n## MATCH\n\n- **FACT:** Team A vs Team B; Team A home, Team B away.\n\n## TEAM 1 FORM\n- **FACT:** Team A\n\n## TEAM 2 FORM\n- **FACT:** Team B\n`;
+    const t = traceOf(raw);
+    assert.equal(t.input.currentVenue, 'HOME');
+    assert.equal(t.input.team1.currentVenue, 'HOME');
+    assert.equal(t.input.team2.currentVenue, 'AWAY');
+    assert.equal(t.components.venueAdjustment, 0.08);
+
+    const away = traceOf(raw.replace('Team A home, Team B away', 'Team B home, Team A away'));
+    assert.equal(away.input.team1.currentVenue, 'AWAY');
+    assert.equal(away.input.team2.currentVenue, 'HOME');
+    assert.equal(away.components.venueAdjustment, -0.08);
+
+    const neutral = traceOf(raw.replace('; Team A home, Team B away', '; neutral venue'));
+    assert.equal(neutral.input.currentVenue, 'NEUTRAL');
+    assert.equal(neutral.components.venueAdjustment, 0);
+  });
+
+  test('D30-6: fallback-поведение не изменилось (empty forms → draw.base=28)', () => {
+    const t = traceOf(buildEmptyFormsVdp());
+    assert.equal(t.draw.base, 28);
+    assert.equal(t.draw.drawRate, null);
+    assert.equal(t.draw.h2hDrawRate, null);
+    assert.equal(t.components.venueAdjustment, 0);
+    assert.equal(t.components.h2hScore, 0.5);
+    assert.equal(t.components.formScore.team1, 0.5);
+    assert.equal(t.components.formScore.team2, 0.5);
+    assert.deepEqual(t.normalized.final, calculateProbabilities(parseVDP(buildEmptyFormsVdp())));
   });
 });

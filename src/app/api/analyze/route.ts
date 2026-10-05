@@ -4,7 +4,7 @@ import { adaptHockeyVDPToEngineInput } from '@/lib/hockey/hockey-engine-adapter'
 import { predictHockeyMatch } from '@/lib/hockey/hockey-engine';
 import { parseVDP } from '@/lib/vdp-parser';
 import type { ParsedVDP } from '@/lib/vdp-parser';
-import { calculateProbabilities } from '@/lib/probability-engine';
+import { calculateProbabilitiesWithTrace } from '@/lib/probability-engine';
 import { calculateGoalDistribution } from '@/lib/goal-distribution';
 import type { GoalDistributionInput, GoalDistributionResult } from '@/lib/goal-distribution';
 import { extractVDP } from '@/lib/vdp-extractor';
@@ -1679,8 +1679,10 @@ K. Финальный JSON соответствует существующему
       h2h: mergedVDP.h2h.length,
     }));
 
-    const engineProbabilities = calculateProbabilities(mergedVDP);
+    const engineComputation = calculateProbabilitiesWithTrace(mergedVDP);
+    const engineProbabilities = engineComputation.result;
     console.log('[ORAKUL DIAGNOSTIC] Probability Engine:', `team1=${engineProbabilities.team1} draw=${engineProbabilities.draw} team2=${engineProbabilities.team2}`);
+    console.log('[ProbabilityEngineTrace]', JSON.stringify(engineComputation.trace));
 
     const goalDistribution = calculateGoalDistribution(buildGoalDistributionInput(mergedVDP));
     console.log('[ORAKUL DIAGNOSTIC] Goal Distribution:', `lambda1=${goalDistribution.lambda1} lambda2=${goalDistribution.lambda2} residual=${goalDistribution.diagnostics.residual}`);

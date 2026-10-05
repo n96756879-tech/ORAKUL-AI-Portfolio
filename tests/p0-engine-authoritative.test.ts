@@ -89,6 +89,10 @@ describe('A1: engine probabilities remain authoritative over LLM probabilities',
     mock.module('@/lib/probability-engine', {
       namedExports: {
         calculateProbabilities: () => ({ team1: 38, draw: 17, team2: 45 }),
+        calculateProbabilitiesWithTrace: () => ({
+          result: { team1: 38, draw: 17, team2: 45 },
+          trace: {} as any,
+        }),
       },
     });
 
