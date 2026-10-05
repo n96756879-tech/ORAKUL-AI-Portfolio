@@ -5,6 +5,8 @@ import { predictHockeyMatch } from '@/lib/hockey/hockey-engine';
 import { parseVDP } from '@/lib/vdp-parser';
 import type { ParsedVDP } from '@/lib/vdp-parser';
 import { calculateProbabilitiesWithTrace } from '@/lib/probability-engine';
+import { persistGoldRecord } from '@/lib/gold-record';
+import type { GoldRecord } from '@/lib/gold-record';
 import { calculateGoalDistribution } from '@/lib/goal-distribution';
 import type { GoalDistributionInput, GoalDistributionResult } from '@/lib/goal-distribution';
 import { extractVDP } from '@/lib/vdp-extractor';
@@ -1679,10 +1681,27 @@ K. Финальный JSON соответствует существующему
       h2h: mergedVDP.h2h.length,
     }));
 
+    const generatedAt = new Date().toISOString();
     const engineComputation = calculateProbabilitiesWithTrace(mergedVDP);
     const engineProbabilities = engineComputation.result;
     console.log('[ORAKUL DIAGNOSTIC] Probability Engine:', `team1=${engineProbabilities.team1} draw=${engineProbabilities.draw} team2=${engineProbabilities.team2}`);
     console.log('[ProbabilityEngineTrace]', JSON.stringify(engineComputation.trace));
+
+    persistGoldRecord({
+      id: crypto.randomUUID(),
+      generatedAt,
+      preMatchDataCutoff: generatedAt,
+      team1: mergedVDP.team1.teamName,
+      team2: mergedVDP.team2.teamName,
+      matchDate: null,
+      competition: null,
+      preMatch: mergedVDP,
+      engineOutput: {
+        probabilities: engineProbabilities,
+        trace: engineComputation.trace,
+      },
+      actual: null,
+    });
 
     const goalDistribution = calculateGoalDistribution(buildGoalDistributionInput(mergedVDP));
     console.log('[ORAKUL DIAGNOSTIC] Goal Distribution:', `lambda1=${goalDistribution.lambda1} lambda2=${goalDistribution.lambda2} residual=${goalDistribution.diagnostics.residual}`);
