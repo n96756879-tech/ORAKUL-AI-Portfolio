@@ -5,7 +5,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { calculateProbabilities, calculateProbabilitiesWithTrace, buildEngineTrace, formScore } from '../src/lib/probability-engine';
+import { calculateProbabilities, calculateProbabilitiesWithTrace, buildEngineTrace, applyGuardedB, formScore } from '../src/lib/probability-engine';
 import { parseVDP } from '../src/lib/vdp-parser';
 import {
   buildFullVdp,
@@ -162,7 +162,7 @@ describe('P0 Probability Engine — formScore excludes UNKNOWN from denominator'
     assert.notEqual(formScore(parsed.team2), 5 / 12);
   });
 
-  test('R3: Netherlands–Germany fixture — формы 8/12 и 7/12 и Engine 39/22/39', () => {
+  test('R3: Netherlands–Germany fixture — формы 8/12 и 7/12 и Engine 40/22/38 (Guarded B)', () => {
     const raw = readFileSync(fileURLToPath(new URL('../real-vdp-sample.txt', import.meta.url)), 'utf8');
     const parsed = parseVDP(raw);
 
@@ -178,22 +178,26 @@ describe('P0 Probability Engine — formScore excludes UNKNOWN from denominator'
     assert.equal(formScore(parsed.team2), 7 / 12);
 
     const r = calculateProbabilities(parsed);
-    assert.deepEqual(r, { team1: 39, draw: 22, team2: 39 });
+    assert.deepEqual(r, { team1: 40, draw: 22, team2: 38 });
   });
 
   test('R4: fixture без UNKNOWN сохраняет прежний результат', () => {
     const parsed = parseVDP(buildFullVdp());
-    // Регрессия: без UNKNOWN знаменатель не меняется, поэтому вывод прежний.
+    // Регрессия: без UNKNOWN знаменатель не меняется, поэтому formScore прежний.
     assert.equal(formScore(parsed.team1), 10 / 15);
     assert.equal(formScore(parsed.team2), 7 / 15);
     const r = calculateProbabilities(parsed);
-    assert.deepEqual(r, { team1: 48, draw: 19, team2: 33 });
+    // D-66: итоговые 1X2 теперь проходят через Guarded B (48/19/33 → 52/19/29),
+    // draw не меняется.
+    assert.deepEqual(r, { team1: 52, draw: 19, team2: 29 });
   });
 
   test('R5 (E): venueAdjustment берёт venue из ParsedVDP.currentVenue, не из matches[0]', () => {
     // D-29: источник venue — venue ТЕКУЩЕГО матча (currentVenue), а не исторический
     // matches[0]. Асимметричный fixture: team1 сильнее (W vs L).
     // Меняем ТОЛЬКО MATCH-FACT (currentVenue) и MATCH 1 (историческое venue).
+    // D-66: счёт team2 = 0-2 (не 0-3), чтобы оба сигнала Guarded B оставались
+    // положительными во всех venue-вариантах и порядок venue не зависел от границы guard.
     const build = (matchFact: string, m1t1 = 'NEUTRAL', m1t2 = 'NEUTRAL') => {
       const t1 = [
         matchBlock(1, '2026-09-20', 'O', m1t1, '3-0', 'W'),
@@ -203,11 +207,11 @@ describe('P0 Probability Engine — formScore excludes UNKNOWN from denominator'
         matchBlock(5, '2026-08-23', 'O', 'NEUTRAL', '3-0', 'W'),
       ];
       const t2 = [
-        matchBlock(1, '2026-09-19', 'O', m1t2, '0-3', 'L'),
-        matchBlock(2, '2026-09-12', 'O', 'NEUTRAL', '0-3', 'L'),
-        matchBlock(3, '2026-09-05', 'O', 'NEUTRAL', '0-3', 'L'),
-        matchBlock(4, '2026-08-29', 'O', 'NEUTRAL', '0-3', 'L'),
-        matchBlock(5, '2026-08-22', 'O', 'NEUTRAL', '0-3', 'L'),
+        matchBlock(1, '2026-09-19', 'O', m1t2, '0-2', 'L'),
+        matchBlock(2, '2026-09-12', 'O', 'NEUTRAL', '0-2', 'L'),
+        matchBlock(3, '2026-09-05', 'O', 'NEUTRAL', '0-2', 'L'),
+        matchBlock(4, '2026-08-29', 'O', 'NEUTRAL', '0-2', 'L'),
+        matchBlock(5, '2026-08-22', 'O', 'NEUTRAL', '0-2', 'L'),
       ];
       const raw = `# VERIFIED DATA PACK\n\n## MATCH\n\n- **FACT:** ${matchFact}\n\n## TEAM 1 FORM\n- **FACT:** Team A\n\n${t1.join('\n\n')}\n\n## TEAM 2 FORM\n- **FACT:** Team B\n\n${t2.join('\n\n')}\n`;
       return calculateProbabilities(parseVDP(raw));
@@ -335,5 +339,120 @@ describe('D-30 Probability Engine diagnostic trace', () => {
     assert.equal(t.components.formScore.team1, 0.5);
     assert.equal(t.components.formScore.team2, 0.5);
     assert.deepEqual(t.normalized.final, calculateProbabilities(parseVDP(buildEmptyFormsVdp())));
+  });
+});
+
+// D-66: Guarded B — уменьшение чрезмерного сглаживания P1/P2.
+// Публичный вход (calculateProbabilities) для сценариев, достижимых через fixtures,
+// и прямой вызов экспортированного production-хелпера applyGuardedB для числовых
+// граничных случаев, которые нельзя стабильно воспроизвести через парсер.
+describe('D-66 Guarded B', () => {
+  // team1: 5 побед крупно; team2: 5 поражений крупно; H2H за team1; team1 дома.
+  // Даёт signal2 < 0 → срабатывает guard и возвращается точный базовый результат.
+  const negativeSignalVdp = (): string => {
+    const t1 = [1, 2, 3, 4, 5].map((n) => matchBlock(n, '2026-09-20', 'O', 'HOME', '3-0', 'W'));
+    const t2 = [1, 2, 3, 4, 5].map((n) => matchBlock(n, '2026-09-19', 'O', 'AWAY', '0-3', 'L'));
+    return `## MATCH
+
+- **FACT:** Team A vs Team B; Team A home, Team B away.
+
+## TEAM 1 FORM
+
+${t1.join('\n\n')}
+
+## TEAM 2 FORM
+
+${t2.join('\n\n')}
+
+## H2H
+
+- **FACT:** Team A 3-0 Team B.
+- **DATE:** 14.11.2024.
+- **SCORE:** 3-0.
+- **WINNER:** Team A.
+- **STATUS:** CONFIRMED.
+`;
+  };
+
+  test('D66-1: положительные сигналы — P1/P2 декомпрессированы, X неизменен, сумма 100', () => {
+    const r = calculateProbabilities(parseVDP(buildFullVdp()));
+    // Guarded B поверх baseline 48/19/33 даёт 52/19/29 (draw сохраняется).
+    assert.deepEqual(r, { team1: 52, draw: 19, team2: 29 });
+    assert.equal(r.team1 + r.draw + r.team2, 100);
+    assert.ok(Number.isInteger(r.team1) && Number.isInteger(r.draw) && Number.isInteger(r.team2));
+    assert.ok(r.team1 >= 0 && r.draw >= 0 && r.team2 >= 0);
+  });
+
+  test('D66-2: один отрицательный сигнал — точный fallback, отрицательных вероятностей нет', () => {
+    const parsed = parseVDP(negativeSignalVdp());
+    const t = buildEngineTrace(parsed);
+    assert.ok(t.raw.team2 - 0.20 < 0, 'fixture должен давать signal2 < 0');
+    const r = calculateProbabilities(parsed);
+    // Guarded B неприменим → точный базовый результат normalizeTo100 (77/10/13).
+    assert.deepEqual(r, { team1: 77, draw: 10, team2: 13 });
+    assert.ok(r.team1 >= 0 && r.draw >= 0 && r.team2 >= 0);
+    assert.equal(r.team1 + r.draw + r.team2, 100);
+  });
+
+  test('D66-3: равные положительные сигналы — детерминированное симметричное распределение', () => {
+    const r = calculateProbabilities(parseVDP(buildEmptyFormsVdp()));
+    // rawTeam1 === rawTeam2 === 0.5 → симметричный остаток (100-26)=74 → 37/37.
+    assert.deepEqual(r, { team1: 37, draw: 26, team2: 37 });
+    assert.equal(r.team1 + r.draw + r.team2, 100);
+    // Детерминизм.
+    assert.deepEqual(calculateProbabilities(parseVDP(buildEmptyFormsVdp())), r);
+  });
+
+  test('D66-4: applyGuardedB — положительные сигналы распределяют (100-X) и дают сумму 100', () => {
+    const [p1, p2] = applyGuardedB(0.655827, 0.450792, 19, 48, 33);
+    assert.deepEqual([p1, p2], [52, 29]);
+    assert.equal(p1 + 19 + p2, 100);
+  });
+
+  test('D66-5: applyGuardedB — нулевой сигнал → точный fallback', () => {
+    const [p1, p2] = applyGuardedB(0.20, 0.45, 19, 48, 33);
+    assert.deepEqual([p1, p2], [48, 33]);
+  });
+
+  test('D66-6: applyGuardedB — оба отрицательных сигнала → точный fallback', () => {
+    const [p1, p2] = applyGuardedB(0.15, 0.10, 30, 40, 30);
+    assert.deepEqual([p1, p2], [40, 30]);
+  });
+
+  test('D66-7: applyGuardedB — сумма сигналов около нуля → точный fallback без NaN/Infinity', () => {
+    for (const [a, b] of [[0.20, 0.20], [0.2001, 0.1999], [0.20, 0.1999]]) {
+      const [p1, p2] = applyGuardedB(a, b, 30, 40, 30);
+      assert.ok(Number.isFinite(p1) && Number.isFinite(p2));
+      assert.deepEqual([p1, p2], [40, 30]);
+    }
+  });
+
+  test('D66-8: applyGuardedB — границы clamp X=8 и X=45, неотрицательность и сумма 100', () => {
+    for (const x of [8, 45]) {
+      const [p1, p2] = applyGuardedB(0.6, 0.4, x, 61, 31);
+      assert.ok(p1 >= 0 && p2 >= 0);
+      assert.ok(Number.isFinite(p1) && Number.isFinite(p2));
+      assert.equal(p1 + x + p2, 100);
+    }
+  });
+
+  test('D66-9: fallback не меняет ни один процент базового результата', () => {
+    // Для любого нарушенного предусловия возвращается ровно переданный baseline.
+    const baseline: [number, number] = [48, 33];
+    const cases: [number, number][] = [[0.20, 0.45], [0.54, 0.137], [0.15, 0.10], [0.20, 0.20], [0.10, 0.05]];
+    for (const [a, b] of cases) {
+      assert.deepEqual(applyGuardedB(a, b, 19, baseline[0], baseline[1]), baseline);
+    }
+  });
+
+  test('D66-10: trace-поля согласованы — raw/draw неизменны, final === calculateProbabilities', () => {
+    const parsed = parseVDP(buildFullVdp());
+    const computed = calculateProbabilitiesWithTrace(parsed);
+    assert.deepEqual(computed.trace.normalized.final, computed.result);
+    assert.deepEqual(computed.result, calculateProbabilities(parsed));
+    // draw в trace.exact соответствует итоговому draw (Guarded B меняет только P1/P2).
+    assert.equal(computed.trace.normalized.final.draw, computed.result.draw);
+    // raw-значения не подменяются итоговыми вероятностями.
+    assert.ok(computed.trace.raw.team1 < 1 && computed.trace.raw.team2 < 1);
   });
 });

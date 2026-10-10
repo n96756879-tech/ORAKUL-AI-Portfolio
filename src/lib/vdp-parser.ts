@@ -850,8 +850,15 @@ function extractCurrentVenue(
     if (!fm) continue;
     const fact = fm[1].replace(/\*/g, "").trim();
 
-    const homeMatch = fact.match(/([\p{L}][\p{L}.'\- ]*?)\s+(?:is\s+)?home\b/iu);
-    const awayMatch = fact.match(/([\p{L}][\p{L}.'\- ]*?)\s+(?:is\s+)?away\b/iu);
+    // D-68: English markers keep their exact `\b` boundary; Russian markers use a
+    // letter-lookahead because JS `\b` does not fire next to Cyrillic letters.
+    // HOME: home / дома / на своём (своем) поле. AWAY: away / в гостях / на выезде.
+    const homeMatch = fact.match(
+      /([\p{L}][\p{L}.'\- ]*?)\s+(?:is\s+)?(?:home\b|дома(?![\p{L}])|на\s+сво[её]м\s+поле(?![\p{L}]))/iu,
+    );
+    const awayMatch = fact.match(
+      /([\p{L}][\p{L}.'\- ]*?)\s+(?:is\s+)?(?:away\b|в\s+гостях(?![\p{L}])|на\s+выезде(?![\p{L}]))/iu,
+    );
     if (homeMatch && awayMatch) {
       const home = homeMatch[1].split(/[,;:]/).pop()!.trim();
       const away = awayMatch[1].split(/[,;:]/).pop()!.trim();
@@ -884,8 +891,8 @@ function extractCurrentVenue(
       return "UNKNOWN";
     }
 
-    // Explicit neutral (e.g. "neutral venue") без home/away привязки.
-    if (/\bneutral\b/i.test(fact)) return "NEUTRAL";
+    // Explicit neutral (e.g. "neutral venue" / «нейтральное поле» / «на нейтральном поле»).
+    if (/\bneutral\b|нейтральн[а-яё]*\s+пол[ея]/iu.test(fact)) return "NEUTRAL";
   }
   return "UNKNOWN";
 }

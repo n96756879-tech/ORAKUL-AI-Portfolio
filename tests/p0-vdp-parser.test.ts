@@ -766,4 +766,171 @@ Turkey beat Italy
     assert.equal(parsed.team2.matches[0]?.venue, 'AWAY');
     assert.equal(parsed.currentVenue, 'UNKNOWN');
   });
+
+  // D-68: Russian venue markers inside ## MATCH FACT lines.
+  test('D-68 T33: Russian HOME clause -> HOME', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** Крылья Советов vs Спартак Москва, РПЛ; Крылья Советов дома, Спартак Москва в гостях.
+
+## TEAM 1 - RECENT FORM: КРЫЛЬЯ СОВЕТОВ
+- **FACT:** form
+
+## TEAM 2 - RECENT FORM: СПАРТАК МОСКВА
+- **FACT:** form
+`);
+    assert.equal(parsed.team1.teamName, 'КРЫЛЬЯ СОВЕТОВ');
+    assert.equal(parsed.team2.teamName, 'СПАРТАК МОСКВА');
+    assert.equal(parsed.currentVenue, 'HOME');
+  });
+
+  test('D-68 T34: Russian AWAY clause -> AWAY (reversed fixture)', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** Alpha vs Beta, League; Beta дома, Alpha в гостях.
+
+## TEAM 1 FORM
+- **FACT:** Alpha
+
+## TEAM 2 FORM
+- **FACT:** Beta
+`);
+    assert.equal(parsed.currentVenue, 'AWAY');
+  });
+
+  test('D-68 T35: Russian neutral clause -> NEUTRAL', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** Alpha vs Beta, League; нейтральное поле.
+
+## TEAM 1 FORM
+- **FACT:** Alpha
+
+## TEAM 2 FORM
+- **FACT:** Beta
+`);
+    assert.equal(parsed.currentVenue, 'NEUTRAL');
+  });
+
+  test('D-68 T36: Russian capitalization / case variants handled', () => {
+    const homeOnOwnField = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** Крылья Советов На своём поле, Спартак Москва НА ВЫЕЗДЕ.
+
+## TEAM 1 - RECENT FORM: КРЫЛЬЯ СОВЕТОВ
+- **FACT:** form
+
+## TEAM 2 - RECENT FORM: СПАРТАК МОСКВА
+- **FACT:** form
+`);
+    assert.equal(homeOnOwnField.currentVenue, 'HOME');
+
+    const awayUpper = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** Alpha vs Beta, League; Alpha В ГОСТЯХ, Beta ДОМА.
+
+## TEAM 1 FORM
+- **FACT:** Alpha
+
+## TEAM 2 FORM
+- **FACT:** Beta
+`);
+    assert.equal(awayUpper.currentVenue, 'AWAY');
+  });
+
+  test('D-68 T37: English markers still parsed alongside Russian support', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** Alpha vs Beta, League, 04.10.2026; Alpha home, Beta away.
+
+## TEAM 1 FORM
+- **FACT:** Alpha
+
+## TEAM 2 FORM
+- **FACT:** Beta
+`);
+    assert.equal(parsed.currentVenue, 'HOME');
+  });
+
+  test('D-68 T38: no venue statement -> UNKNOWN (Russian teams, no guessing)', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** Крылья Советов vs Спартак Москва, РПЛ, 04.10.2026.
+
+## TEAM 1 - RECENT FORM: КРЫЛЬЯ СОВЕТОВ
+- **FACT:** form
+
+## TEAM 2 - RECENT FORM: СПАРТАК МОСКВА
+- **FACT:** form
+`);
+    assert.equal(parsed.currentVenue, 'UNKNOWN');
+  });
+
+  test('D-68 T39: team order alone does not infer venue', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** Alpha vs Beta, League, 04.10.2026.
+
+## TEAM 1 FORM
+- **FACT:** Alpha
+
+## TEAM 2 FORM
+- **FACT:** Beta
+`);
+    assert.equal(parsed.currentVenue, 'UNKNOWN');
+  });
+
+  test('D-68 T40: Russian venue wording outside ## MATCH is not accepted', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** Alpha vs Beta, League, 04.10.2026.
+
+## TEAM 1 FORM
+- **FACT:** Alpha дома
+
+## TEAM 2 FORM
+- **FACT:** Beta в гостях
+`);
+    assert.equal(parsed.currentVenue, 'UNKNOWN');
+  });
+
+  test('D-68 T41: Russian venue wording on a non-FACT line inside ## MATCH is not accepted', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** Alpha vs Beta, League, 04.10.2026.
+- Note: Alpha дома, Beta в гостях.
+
+## TEAM 1 FORM
+- **FACT:** Alpha
+
+## TEAM 2 FORM
+- **FACT:** Beta
+`);
+    assert.equal(parsed.currentVenue, 'UNKNOWN');
+  });
+
+  test('D-68 T42: Russian clause with unmatched team names -> UNKNOWN (no guessing)', () => {
+    const parsed = parseVDP(`# VERIFIED DATA PACK
+
+## MATCH
+- **FACT:** Gamma дома, Delta в гостях.
+
+## TEAM 1 FORM
+- **FACT:** Alpha
+
+## TEAM 2 FORM
+- **FACT:** Beta
+`);
+    assert.equal(parsed.currentVenue, 'UNKNOWN');
+  });
 });

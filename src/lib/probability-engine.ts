@@ -51,6 +51,10 @@ export type ProbabilityEngineTrace = {
   draw: EngineDrawTrace;
   raw: { team1: number; team2: number; draw: number; total: number };
   normalized: {
+    // exact — точная (неокруглённая) нормализация ИСХОДНЫХ raw-значений
+    // (rawTeam1/rawDraw/rawTeam2). Это диагностический промежуточный слой для
+    // ручного пересчёта и НЕ итоговый результат: он не включает D-66 Guarded B.
+    // Авторитетным итогом 1X2 всегда является final.
     exact: { team1: number; draw: number; team2: number };
     final: ProbabilityResult;
   };
@@ -251,6 +255,54 @@ function normalizeTo100(a: number, b: number, c: number): [number, number, numbe
   return [result[0], result[1], result[2]];
 }
 
+// D-66 Guarded B: уменьшает чрезмерное сглаживание P1/P2, распределяя остаток
+// (100 - draw) пропорционально положительным сигналам rawTeam - 0.20.
+// Применяется только когда оба сигнала конечны и строго положительны, их сумма
+// конечна и положительна, а остаток (100 - draw) — неотрицательное целое.
+// При любом нарушении предусловий возвращается точный базовый результат
+// normalizeTo100 (P1/P2 не меняются). draw всегда сохраняется вызывающим кодом.
+// Использует тот же largest-remainder подход, что и normalizeTo100, поэтому
+// сумма P1 + draw + P2 всегда остаётся ровно 100.
+export function applyGuardedB(
+  rawTeam1: number,
+  rawTeam2: number,
+  baselineDraw: number,
+  baselineTeam1: number,
+  baselineTeam2: number
+): [number, number] {
+  const signal1 = rawTeam1 - 0.20;
+  const signal2 = rawTeam2 - 0.20;
+  const signalSum = signal1 + signal2;
+  const remainder = 100 - baselineDraw;
+
+  const applicable =
+    Number.isFinite(signal1) &&
+    Number.isFinite(signal2) &&
+    signal1 > 0 &&
+    signal2 > 0 &&
+    Number.isFinite(signalSum) &&
+    signalSum > 0 &&
+    Number.isInteger(remainder) &&
+    remainder >= 0;
+
+  if (!applicable) {
+    return [baselineTeam1, baselineTeam2];
+  }
+
+  const exact1 = (remainder * signal1) / signalSum;
+  const exact2 = (remainder * signal2) / signalSum;
+  const floor1 = Math.floor(exact1);
+  const floor2 = Math.floor(exact2);
+  const leftover = remainder - (floor1 + floor2);
+  const order = [
+    { idx: 0, frac: exact1 - floor1 },
+    { idx: 1, frac: exact2 - floor2 },
+  ].sort((a, b) => b.frac - a.frac);
+  const out = [floor1, floor2];
+  for (let i = 0; i < leftover; i++) out[order[i].idx]++;
+  return [out[0], out[1]];
+}
+
 // D-30: единый расчёт — возвращает и результат, и diagnostic trace.
 // Это ТОТ ЖЕ арифметический путь, что и раньше: формулы, веса, clamp и нормализация
 // не менялись; trace лишь фиксирует уже вычисленные промежуточные значения.
@@ -288,8 +340,11 @@ function computeWithTrace(parsed: ParsedVDP): EngineComputation {
   const drawTrace = calculateDrawProbabilityTrace(parsed.team1, parsed.team2, parsed.h2h);
   const drawRaw = drawTrace.drawPct / 100;
 
-  const [team1, draw, team2] = normalizeTo100(rawTeam1, drawRaw, rawTeam2);
-  const result: ProbabilityResult = { team1, draw, team2 };
+  const [baselineTeam1, baselineDraw, baselineTeam2] = normalizeTo100(rawTeam1, drawRaw, rawTeam2);
+  // D-66: Guarded B применяется поверх базового результата; при невыполнении
+  // предусловий возвращается точный базовый результат без изменения draw.
+  const [team1, team2] = applyGuardedB(rawTeam1, rawTeam2, baselineDraw, baselineTeam1, baselineTeam2);
+  const result: ProbabilityResult = { team1, draw: baselineDraw, team2 };
 
   const total = rawTeam1 + drawRaw + rawTeam2;
   const teamTrace = (team: ParsedTeam, venue: EngineVenue): EngineTeamTrace => {
