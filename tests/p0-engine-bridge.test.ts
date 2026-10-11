@@ -131,12 +131,12 @@ describe('STEP 18 Engine Bridge', () => {
     assert.equal(merged.team2.matches[0].opponent, 'R');
   });
 
-  test('C4: без VDP-матчей и без DataPack → старый fallback Engine сохранён (37/26/37)', () => {
+  test('C4: без VDP-матчей и без DataPack → старый fallback Engine сохранён (38/24/38)', () => {
     const input = vdp();
     const merged = mergeEngineInput(input, null);
 
     assert.deepEqual(calculateProbabilities(merged), calculateProbabilities(input));
-    assert.deepEqual(calculateProbabilities(merged), { team1: 37, draw: 26, team2: 37 });
+    assert.deepEqual(calculateProbabilities(merged), { team1: 38, draw: 24, team2: 38 });
   });
 
   test('C5: подтверждённый DataPack H2H заполняет пустой VDP H2H', () => {

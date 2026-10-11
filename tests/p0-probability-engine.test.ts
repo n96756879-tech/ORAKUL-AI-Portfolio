@@ -5,7 +5,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { calculateProbabilities, calculateProbabilitiesWithTrace, buildEngineTrace, applyGuardedB, formScore } from '../src/lib/probability-engine';
+import { calculateProbabilities, calculateProbabilitiesWithTrace, buildEngineTrace, applyGuardedB, applyTemperatureScaling, CALIBRATION_TEMPERATURE, formScore } from '../src/lib/probability-engine';
 import { parseVDP } from '../src/lib/vdp-parser';
 import {
   buildFullVdp,
@@ -48,15 +48,15 @@ describe('P0 Probability Engine (current behavior)', () => {
   test('T9: empty/minimal ParsedVDP — current fallback behavior (37/26/37)', () => {
     // Пустой вход
     const rEmpty = calculateProbabilities(parseVDP(''));
-    assert.deepEqual(rEmpty, { team1: 37, draw: 26, team2: 37 });
+    assert.deepEqual(rEmpty, { team1: 38, draw: 24, team2: 38 });
 
     // Имена есть, матчей нет — тот же fallback
     const rNamesOnly = calculateProbabilities(parseVDP(buildEmptyFormsVdp()));
-    assert.deepEqual(rNamesOnly, { team1: 37, draw: 26, team2: 37 });
+    assert.deepEqual(rNamesOnly, { team1: 38, draw: 24, team2: 38 });
 
     // Минимальный: по одному матчу — НЕ fallback (фиксируем факт)
     const rOne = calculateProbabilities(parseVDP(buildIncompleteVdp(1, 1)));
-    assert.notDeepEqual(rOne, { team1: 37, draw: 26, team2: 37 });
+    assert.notDeepEqual(rOne, { team1: 38, draw: 24, team2: 38 });
     assert.equal(rOne.team1 + rOne.draw + rOne.team2, 100);
   });
 
@@ -178,7 +178,7 @@ describe('P0 Probability Engine — formScore excludes UNKNOWN from denominator'
     assert.equal(formScore(parsed.team2), 7 / 12);
 
     const r = calculateProbabilities(parsed);
-    assert.deepEqual(r, { team1: 40, draw: 22, team2: 38 });
+    assert.deepEqual(r, { team1: 42, draw: 18, team2: 40 });
   });
 
   test('R4: fixture без UNKNOWN сохраняет прежний результат', () => {
@@ -188,8 +188,8 @@ describe('P0 Probability Engine — formScore excludes UNKNOWN from denominator'
     assert.equal(formScore(parsed.team2), 7 / 15);
     const r = calculateProbabilities(parsed);
     // D-66: итоговые 1X2 теперь проходят через Guarded B (48/19/33 → 52/19/29),
-    // draw не меняется.
-    assert.deepEqual(r, { team1: 52, draw: 19, team2: 29 });
+    // draw не меняется. D-72: калибровка T=0.713 → 59/15/26.
+    assert.deepEqual(r, { team1: 59, draw: 15, team2: 26 });
   });
 
   test('R5 (E): venueAdjustment берёт venue из ParsedVDP.currentVenue, не из matches[0]', () => {
@@ -198,7 +198,7 @@ describe('P0 Probability Engine — formScore excludes UNKNOWN from denominator'
     // Меняем ТОЛЬКО MATCH-FACT (currentVenue) и MATCH 1 (историческое venue).
     // D-66: счёт team2 = 0-2 (не 0-3), чтобы оба сигнала Guarded B оставались
     // положительными во всех venue-вариантах и порядок venue не зависел от границы guard.
-    const build = (matchFact: string, m1t1 = 'NEUTRAL', m1t2 = 'NEUTRAL') => {
+    const buildTrace = (matchFact: string, m1t1 = 'NEUTRAL', m1t2 = 'NEUTRAL') => {
       const t1 = [
         matchBlock(1, '2026-09-20', 'O', m1t1, '3-0', 'W'),
         matchBlock(2, '2026-09-13', 'O', 'NEUTRAL', '3-0', 'W'),
@@ -214,16 +214,29 @@ describe('P0 Probability Engine — formScore excludes UNKNOWN from denominator'
         matchBlock(5, '2026-08-22', 'O', 'NEUTRAL', '0-2', 'L'),
       ];
       const raw = `# VERIFIED DATA PACK\n\n## MATCH\n\n- **FACT:** ${matchFact}\n\n## TEAM 1 FORM\n- **FACT:** Team A\n\n${t1.join('\n\n')}\n\n## TEAM 2 FORM\n- **FACT:** Team B\n\n${t2.join('\n\n')}\n`;
-      return calculateProbabilities(parseVDP(raw));
+      return calculateProbabilitiesWithTrace(parseVDP(raw));
     };
+    const build = (matchFact: string, m1t1 = 'NEUTRAL', m1t2 = 'NEUTRAL') =>
+      buildTrace(matchFact, m1t1, m1t2).result;
 
-    const homeVenue = build('Team A vs Team B; Team A home, Team B away.');
-    const awayVenue = build('Team A vs Team B; Team B home, Team A away.');
-    const unknownVenue = build('Team A vs Team B, League, 04.10.2026');
+    const homeTrace = buildTrace('Team A vs Team B; Team A home, Team B away.');
+    const awayTrace = buildTrace('Team A vs Team B; Team B home, Team A away.');
+    const unknownTrace = buildTrace('Team A vs Team B, League, 04.10.2026');
+    const homeVenue = homeTrace.result;
+    const awayVenue = awayTrace.result;
+    const unknownVenue = unknownTrace.result;
 
     // currentVenue=HOME → team1 бонус; AWAY → штраф; без venue → нейтрально.
     assert.equal(unknownVenue.team1 + unknownVenue.draw + unknownVenue.team2, 100);
-    assert.ok(homeVenue.team1 > unknownVenue.team1, 'currentVenue HOME должен увеличить team1');
+    assert.equal(homeTrace.trace.components.venueAdjustment, 0.08);
+    assert.equal(awayTrace.trace.components.venueAdjustment, -0.08);
+    assert.equal(unknownTrace.trace.components.venueAdjustment, 0);
+    // D-72: строгий порядок venue проверяется на до-калибровочных вероятностях
+    // (preCalibration), потому что final-калибровка T=0.713 схлопывает хвосты
+    // экстремальных исходов до одинаковых целых (85 и 84 → оба 93).
+    assert.ok(homeTrace.trace.normalized.preCalibration.team1 > unknownTrace.trace.normalized.preCalibration.team1, 'HOME должен увеличить team1 (pre-calibration)');
+    assert.ok(awayTrace.trace.normalized.preCalibration.team1 < unknownTrace.trace.normalized.preCalibration.team1, 'AWAY должен уменьшить team1 (pre-calibration)');
+    assert.ok(homeVenue.team1 >= unknownVenue.team1, 'currentVenue HOME не должен уменьшить team1');
     assert.ok(awayVenue.team1 < unknownVenue.team1, 'currentVenue AWAY должен уменьшить team1');
 
     // Ключевое: исторический MATCH 1 = HOME/AWAY НЕ влияет, если currentVenue неизвестен.
@@ -376,8 +389,8 @@ ${t2.join('\n\n')}
 
   test('D66-1: положительные сигналы — P1/P2 декомпрессированы, X неизменен, сумма 100', () => {
     const r = calculateProbabilities(parseVDP(buildFullVdp()));
-    // Guarded B поверх baseline 48/19/33 даёт 52/19/29 (draw сохраняется).
-    assert.deepEqual(r, { team1: 52, draw: 19, team2: 29 });
+    // Guarded B поверх baseline 48/19/33 даёт 52/19/29, D-72 калибровка T=0.713 → 59/15/26.
+    assert.deepEqual(r, { team1: 59, draw: 15, team2: 26 });
     assert.equal(r.team1 + r.draw + r.team2, 100);
     assert.ok(Number.isInteger(r.team1) && Number.isInteger(r.draw) && Number.isInteger(r.team2));
     assert.ok(r.team1 >= 0 && r.draw >= 0 && r.team2 >= 0);
@@ -388,16 +401,16 @@ ${t2.join('\n\n')}
     const t = buildEngineTrace(parsed);
     assert.ok(t.raw.team2 - 0.20 < 0, 'fixture должен давать signal2 < 0');
     const r = calculateProbabilities(parsed);
-    // Guarded B неприменим → точный базовый результат normalizeTo100 (77/10/13).
-    assert.deepEqual(r, { team1: 77, draw: 10, team2: 13 });
+    // Guarded B неприменим → точный базовый результат normalizeTo100 (77/10/13), D-72 калибровка T=0.713 → 88/5/7.
+    assert.deepEqual(r, { team1: 88, draw: 5, team2: 7 });
     assert.ok(r.team1 >= 0 && r.draw >= 0 && r.team2 >= 0);
     assert.equal(r.team1 + r.draw + r.team2, 100);
   });
 
   test('D66-3: равные положительные сигналы — детерминированное симметричное распределение', () => {
     const r = calculateProbabilities(parseVDP(buildEmptyFormsVdp()));
-    // rawTeam1 === rawTeam2 === 0.5 → симметричный остаток (100-26)=74 → 37/37.
-    assert.deepEqual(r, { team1: 37, draw: 26, team2: 37 });
+    // rawTeam1 === rawTeam2 === 0.5 → Guarded B 37/26/37, D-72 калибровка T=0.713 → 38/24/38.
+    assert.deepEqual(r, { team1: 38, draw: 24, team2: 38 });
     assert.equal(r.team1 + r.draw + r.team2, 100);
     // Детерминизм.
     assert.deepEqual(calculateProbabilities(parseVDP(buildEmptyFormsVdp())), r);
@@ -454,5 +467,131 @@ ${t2.join('\n\n')}
     assert.equal(computed.trace.normalized.final.draw, computed.result.draw);
     // raw-значения не подменяются итоговыми вероятностями.
     assert.ok(computed.trace.raw.team1 < 1 && computed.trace.raw.team2 < 1);
+  });
+});
+
+// D-72: температура калибровки (T = 0.713) — финальный шаг Probability Engine.
+// Калибровка применяется к итогу Guarded B и не меняет базовые формулы.
+describe('D-72 temperature calibration', () => {
+  const assertValidProbs = ([team1, draw, team2]: [number, number, number]) => {
+    for (const p of [team1, draw, team2]) {
+      assert.ok(Number.isFinite(p), `probability must be finite, got ${p}`);
+      assert.ok(Number.isInteger(p), `probability must be integer, got ${p}`);
+      assert.ok(p >= 0 && p <= 100, `probability must be in [0,100], got ${p}`);
+    }
+    assert.equal(team1 + draw + team2, 100, 'calibrated probabilities must sum to exactly 100');
+  };
+
+  test('D72-1: CALIBRATION_TEMPERATURE зафиксирован (0.713)', () => {
+    assert.equal(CALIBRATION_TEMPERATURE, 0.713);
+  });
+
+  test('D72-2: валидированные целочисленные соответствия T=0.713', () => {
+    assert.deepEqual(applyTemperatureScaling(52, 19, 29), [59, 15, 26]);
+    assert.deepEqual(applyTemperatureScaling(40, 22, 38), [42, 18, 40]);
+    assert.deepEqual(applyTemperatureScaling(38, 17, 45), [39, 12, 49]);
+    assert.deepEqual(applyTemperatureScaling(37, 26, 37), [38, 24, 38]);
+    assert.deepEqual(applyTemperatureScaling(77, 10, 13), [88, 5, 7]);
+    for (const t of [
+      applyTemperatureScaling(52, 19, 29),
+      applyTemperatureScaling(40, 22, 38),
+      applyTemperatureScaling(38, 17, 45),
+      applyTemperatureScaling(37, 26, 37),
+      applyTemperatureScaling(77, 10, 13),
+    ]) {
+      assertValidProbs(t);
+    }
+  });
+
+  test('D72-3: выход — конечные целые неотрицательные и сумма ровно 100 (спойлер-сетка)', () => {
+    const grid: [number, number, number][] = [
+      [0, 0, 100], [100, 0, 0], [0, 100, 0],
+      [1, 1, 98], [34, 33, 33], [50, 0, 50], [33, 34, 33],
+      [99, 1, 0], [0, 1, 99], [10, 80, 10], [25, 25, 25],
+    ];
+    for (const input of grid) {
+      const out = applyTemperatureScaling(input[0], input[1], input[2]);
+      assertValidProbs(out);
+    }
+  });
+
+  test('D72-4: argmax и tie-break сохраняются калибровкой', () => {
+    // Monotone поэлементное отношение p^(1/T) сохраняет максимум и его индекс.
+    const cases: [number, number, number][] = [
+      [45, 30, 25], [20, 70, 10], [10, 10, 80], [37, 26, 37],
+      [34, 33, 33], [50, 0, 50], [40, 22, 38], [52, 19, 29],
+    ];
+    const argmax = (a: number[]) => {
+      const m = Math.max(...a);
+      return a.indexOf(m);
+    };
+    for (const [p1, pd, p2] of cases) {
+      const out = applyTemperatureScaling(p1, pd, p2);
+      assert.equal(argmax(out), argmax([p1, pd, p2]), `argmax must be preserved for ${p1}/${pd}/${p2}`);
+      // Связка (tie) остаётся связкой, а не произвольным выбором.
+      if (p1 === p2 && p1 > pd) assert.equal(out[0], out[2], `tie must stay symmetric for ${p1}/${pd}/${p2}`);
+      if (p1 === p2 && p1 === pd) assert.deepEqual(out, [Math.round(100 / 3), Math.round(100 / 3), Math.round(100 / 3)]);
+    }
+  });
+
+  test('D72-5: нулевые вероятности безопасны (clamp 1e-9), детерминизм', () => {
+    const out = applyTemperatureScaling(0, 0, 100);
+    assertValidProbs(out);
+    assert.deepEqual(out, applyTemperatureScaling(0, 0, 100), 'детерминизм');
+    const out2 = applyTemperatureScaling(60, 40, 0);
+    assertValidProbs(out2);
+    assert.equal(out2[2], 0, 'нулевая сторона не должна получить заметную долю');
+    assert.ok(out2[0] > out2[1], 'порядок ненулевых сторон сохранён');
+  });
+
+  test('D72-6: невалидная температура → точное возвращение входа, детерминированно', () => {
+    const input: [number, number, number] = [50, 20, 30];
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      assert.deepEqual(applyTemperatureScaling(50, 20, 30, bad), input, `T=${bad} must return input unchanged`);
+    }
+    // Экстремальные, но допустимые T не ломают инварианты.
+    assertValidProbs(applyTemperatureScaling(40, 22, 38, 0.01));
+    assertValidProbs(applyTemperatureScaling(40, 22, 38, 50));
+  });
+
+  test('D72-7: Guarded B и точный базовый fallback не изменились (до калибровки)', () => {
+    // Прямые хелперы D-66 — независимы от D-72.
+    assert.deepEqual(applyGuardedB(0.655827, 0.450792, 19, 48, 33), [52, 29]);
+    assert.deepEqual(applyGuardedB(0.5, 0.5, 26, 37, 37), [37, 37]);
+    // Невалидный сигнал → точный baseline normalizeTo100 без изменений.
+    assert.deepEqual(applyGuardedB(0.9, 0.1, 10, 77, 13), [77, 13]);
+  });
+
+  test('D72-8: trace разделяет preCalibration и final; final = calibration(preCalibration)', () => {
+    const parsed = parseVDP(buildFullVdp());
+    const computed = calculateProbabilitiesWithTrace(parsed);
+    const pre = computed.trace.normalized.preCalibration;
+    const fin = computed.trace.normalized.final;
+    // preCalibration — результат Guarded B ДО калибровки (для buildFullVdp это 52/19/29).
+    assert.deepEqual(pre, { team1: 52, draw: 19, team2: 29 });
+    assert.deepEqual(fin, { team1: 59, draw: 15, team2: 26 });
+    // final обязан равняться применяемой калибровке к preCalibration.
+    assert.deepEqual(applyTemperatureScaling(pre.team1, pre.draw, pre.team2), [fin.team1, fin.draw, fin.team2]);
+    assert.equal(computed.trace.normalized.temperature, CALIBRATION_TEMPERATURE);
+    // draw Guarded B (19) отличается от финального (15) — значит калибровка — отдельный шаг.
+    assert.notEqual(pre.draw, fin.draw);
+    assert.notDeepEqual(pre, fin);
+  });
+
+  test('D72-9: public output === normalized.final (никакого пост-калибровочного шага)', () => {
+    for (const raw of [buildFullVdp(), buildEmptyFormsVdp(), buildIncompleteVdp(1, 1), '']) {
+      const computed = calculateProbabilitiesWithTrace(parseVDP(raw));
+      assert.deepEqual(computed.result, computed.trace.normalized.final);
+    }
+  });
+
+  test('D72-10: base draw-formula trace (draw.drawPct) не затронута калибровкой', () => {
+    const parsed = parseVDP(buildEmptyFormsVdp());
+    const t = buildEngineTrace(parsed);
+    // drawPct остаётся базовым компонентом draw (8..45), а не финальным draw %.
+    assert.equal(t.draw.drawPct, 34);
+    assert.ok(t.draw.drawPct >= 8 && t.draw.drawPct <= 45);
+    assert.deepEqual(t.normalized.preCalibration, { team1: 37, draw: 26, team2: 37 });
+    assert.deepEqual(t.normalized.final, { team1: 38, draw: 24, team2: 38 });
   });
 });

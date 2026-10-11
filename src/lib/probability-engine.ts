@@ -53,9 +53,13 @@ export type ProbabilityEngineTrace = {
   normalized: {
     // exact — точная (неокруглённая) нормализация ИСХОДНЫХ raw-значений
     // (rawTeam1/rawDraw/rawTeam2). Это диагностический промежуточный слой для
-    // ручного пересчёта и НЕ итоговый результат: он не включает D-66 Guarded B.
-    // Авторитетным итогом 1X2 всегда является final.
+    // ручного пересчёта и НЕ итоговый результат: он не включает D-66 Guarded B
+    // и D-72 калибровку. Авторитетным итогом 1X2 всегда является final.
     exact: { team1: number; draw: number; team2: number };
+    // D-72: preCalibration — итог Guarded B до temperature scaling (raw pre-calibration);
+    // temperature — использованная температура; final — калиброванный результат.
+    temperature: number;
+    preCalibration: ProbabilityResult;
     final: ProbabilityResult;
   };
 };
@@ -303,6 +307,33 @@ export function applyGuardedB(
   return [out[0], out[1]];
 }
 
+// D-72: температура калибровки итоговых вероятностей Guarded B. Подобрана на D-61
+// (минимизация multiclass LogLoss) и проверена на независимом D-62 в эксперименте D-71.
+export const CALIBRATION_TEMPERATURE = 0.713;
+
+// D-72: multiclass temperature scaling поверх итоговых Guarded B вероятностей.
+// q_i = p_i^(1/T) / Σ_j p_j^(1/T). Преобразование монотонно, поэтому порядок и
+// argmax (предсказанный исход) сохраняются — калибровка не может изменить hit rate.
+// Численно безопасно: нулевые вероятности заменяются на EPS до возведения в степень,
+// результат нормализуется тем же largest-remainder методом, что и normalizeTo100,
+// поэтому сумма всегда ровно 100 и нет NaN/Infinity/отрицательных значений.
+export function applyTemperatureScaling(
+  team1: number,
+  draw: number,
+  team2: number,
+  temperature: number = CALIBRATION_TEMPERATURE
+): [number, number, number] {
+  const inv = 1 / temperature;
+  if (!Number.isFinite(inv) || inv <= 0) return [team1, draw, team2];
+  const EPS = 1e-9;
+  const a = Math.pow(Math.max(team1, EPS), inv);
+  const b = Math.pow(Math.max(draw, EPS), inv);
+  const c = Math.pow(Math.max(team2, EPS), inv);
+  const sum = a + b + c;
+  if (!Number.isFinite(sum) || sum <= 0) return [team1, draw, team2];
+  return normalizeTo100(a, b, c);
+}
+
 // D-30: единый расчёт — возвращает и результат, и diagnostic trace.
 // Это ТОТ ЖЕ арифметический путь, что и раньше: формулы, веса, clamp и нормализация
 // не менялись; trace лишь фиксирует уже вычисленные промежуточные значения.
@@ -343,8 +374,16 @@ function computeWithTrace(parsed: ParsedVDP): EngineComputation {
   const [baselineTeam1, baselineDraw, baselineTeam2] = normalizeTo100(rawTeam1, drawRaw, rawTeam2);
   // D-66: Guarded B применяется поверх базового результата; при невыполнении
   // предусловий возвращается точный базовый результат без изменения draw.
-  const [team1, team2] = applyGuardedB(rawTeam1, rawTeam2, baselineDraw, baselineTeam1, baselineTeam2);
-  const result: ProbabilityResult = { team1, draw: baselineDraw, team2 };
+  const [guardedTeam1, guardedTeam2] = applyGuardedB(rawTeam1, rawTeam2, baselineDraw, baselineTeam1, baselineTeam2);
+  const preCalibration: ProbabilityResult = { team1: guardedTeam1, draw: baselineDraw, team2: guardedTeam2 };
+  // D-72: единственная скалярная калибровка поверх итога Guarded B; результат — финальные
+  // вероятности Engine, потребляемые существующим downstream-контрактом.
+  const [team1, draw, team2] = applyTemperatureScaling(
+    preCalibration.team1,
+    preCalibration.draw,
+    preCalibration.team2
+  );
+  const result: ProbabilityResult = { team1, draw, team2 };
 
   const total = rawTeam1 + drawRaw + rawTeam2;
   const teamTrace = (team: ParsedTeam, venue: EngineVenue): EngineTeamTrace => {
@@ -422,6 +461,9 @@ function computeWithTrace(parsed: ParsedVDP): EngineComputation {
         draw: (drawRaw / total) * 100,
         team2: (rawTeam2 / total) * 100,
       },
+      // D-72: preCalibration — итог Guarded B до temperature scaling; final — после.
+      temperature: CALIBRATION_TEMPERATURE,
+      preCalibration,
       final: result,
     },
   };

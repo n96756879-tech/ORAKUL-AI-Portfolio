@@ -182,7 +182,7 @@ describe('P0 API /api/analyze (current behavior)', () => {
     assert.ok(logs.some((line) => line.includes('[ORAKUL DIAGNOSTIC] Goal Distribution:')));
     assert.deepEqual(
       body.probabilities.outcomes.map((outcome: { value: string }) => outcome.value),
-      ['52%', '19%', '29%'],
+      ['59%', '15%', '26%'],
     );
     assert.notDeepEqual(
       body.probabilities.outcomes.map((outcome: { value: string }) => outcome.value),
@@ -317,15 +317,15 @@ describe('P0 API /api/analyze (current behavior)', () => {
     assert.equal(body.probabilities.outcomes.length, 3);
     assert.deepEqual(
       body.probabilities.outcomes.map((outcome: { value: string }) => outcome.value),
-      ['52%', '19%', '29%'],
+      ['59%', '15%', '26%'],
     );
-    assert.ok(logs.some((line) => line.includes('[ORAKUL DIAGNOSTIC] Probability Engine: team1=52 draw=19 team2=29')));
+    assert.ok(logs.some((line) => line.includes('[ORAKUL DIAGNOSTIC] Probability Engine: team1=59 draw=15 team2=26')));
     assert.ok(logs.some((line) => line.includes('[ORAKUL DIAGNOSTIC] Goal Distribution markets:')));
     assert.ok(logs.some((line) => line.includes('[ORAKUL DIAGNOSTIC] LLM Contract probabilities: team1=99 draw=1 team2=0')));
-    assert.ok(logs.some((line) => line.includes('[ORAKUL DIAGNOSTIC] Engine vs LLM: engine=52/19/29 llm=99/1/0 match=false')));
-    assert.ok(logs.some((line) => line.includes('[ORAKUL DIAGNOSTIC] A1 final probabilities: team1=52 draw=19 team2=29')));
-    assert.ok(logs.some((line) => line.includes('[ORAKUL DIAGNOSTIC] A1 vs Engine: engine=52/19/29 a1=52/19/29 match=true')));
-    assert.ok(logs.some((line) => line.includes('[ORAKUL DIAGNOSTIC] Public Response probabilities: team1=52 draw=19 team2=29')));
+    assert.ok(logs.some((line) => line.includes('[ORAKUL DIAGNOSTIC] Engine vs LLM: engine=59/15/26 llm=99/1/0 match=false')));
+    assert.ok(logs.some((line) => line.includes('[ORAKUL DIAGNOSTIC] A1 final probabilities: team1=59 draw=15 team2=26')));
+    assert.ok(logs.some((line) => line.includes('[ORAKUL DIAGNOSTIC] A1 vs Engine: engine=59/15/26 a1=59/15/26 match=true')));
+    assert.ok(logs.some((line) => line.includes('[ORAKUL DIAGNOSTIC] Public Response probabilities: team1=59 draw=15 team2=26')));
   });
 
   test('T17: valid JSON does not retry', async () => {
@@ -351,7 +351,7 @@ describe('P0 API /api/analyze (current behavior)', () => {
     assert.ok(logs.some((line) => line.includes('[LLM] JSON parse failed, retrying once')));
     assert.ok(logs.some((line) => line.includes('[LLM] JSON retry succeeded')));
     const body = await res.json();
-    assert.deepEqual(body.probabilities.outcomes.map((outcome: { value: string }) => outcome.value), ['52%', '19%', '29%']);
+    assert.deepEqual(body.probabilities.outcomes.map((outcome: { value: string }) => outcome.value), ['59%', '15%', '26%']);
   });
 
   test('T19: malformed JSON twice returns existing 502 error', async () => {
@@ -397,6 +397,6 @@ describe('P0 API /api/analyze (current behavior)', () => {
     const res = await POST(makeRequest({ match: 'Team A vs Team B' }));
     assert.equal(res.status, 200);
     const body = await res.json();
-    assert.deepEqual(body.probabilities.outcomes.map((outcome: { value: string }) => outcome.value), ['52%', '19%', '29%']);
+    assert.deepEqual(body.probabilities.outcomes.map((outcome: { value: string }) => outcome.value), ['59%', '15%', '26%']);
   });
 });
