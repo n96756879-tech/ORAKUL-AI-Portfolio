@@ -486,7 +486,7 @@ function adaptAnalysisContractToResponse(
     status: 'success',
     match: {
       title: matchTitle,
-      meta: 'Анализ на основе исследования You.com Research',
+      meta: 'Анализ на основе исследования открытых источников',
     },
     probabilities: {
       outcomes: [
@@ -868,7 +868,7 @@ ${truncatedReport}`;
     status: 'success',
     match: {
       title: contract.match || trimmedMatch,
-      meta: 'Анализ на основе исследования You.com Research и ORAKUL Hockey Engine',
+      meta: 'Анализ на основе исследования открытых источников',
     },
     probabilities: {
       outcomes: outcomeValues,

@@ -109,20 +109,12 @@ export default function Home() {
       <div className="w-full max-w-3xl flex flex-col items-center pt-8 sm:pt-16 pb-16">
         {/* Header */}
         <header className="text-center mb-10">
-          <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-cyan-950/60 border border-cyan-500/20 text-cyan-400 text-xs font-mono uppercase tracking-wider mb-4">
-            <span className="relative flex h-2 w-2">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-cyan-400 opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-2 w-2 bg-cyan-500"></span>
-            </span>
-            KeyDealer Web Search + Gemini 3 Flash
-          </div>
-
           <h1 className="text-4xl sm:text-6xl font-extrabold tracking-tight bg-gradient-to-r from-white via-slate-200 to-cyan-400 bg-clip-text text-transparent">
             ORAKUL AI
           </h1>
 
           <p className="mt-3 text-sm sm:text-base text-slate-400 max-w-lg mx-auto leading-relaxed">
-            AI-анализ спортивных матчей на основе актуальных данных из открытого веба
+            AI-аналитик футбольных матчей на основе актуальных данных
           </p>
         </header>
 
@@ -137,15 +129,6 @@ export default function Home() {
               }`}
             >
               Football
-            </button>
-            <button
-              type="button"
-              onClick={() => setSport('hockey')}
-              className={`px-4 py-1.5 rounded-full text-xs font-mono uppercase tracking-wider transition-all ${
-                sport === 'hockey' ? 'bg-indigo-900 border border-indigo-500 text-indigo-200' : 'bg-slate-800 border border-slate-700 text-slate-400'
-              }`}
-            >
-              Hockey
             </button>
           </div>
           <div className="relative group">
@@ -171,6 +154,48 @@ export default function Home() {
             AI самостоятельно найдёт актуальную информацию о матче и объяснит свой прогноз.
           </p>
         </form>
+
+        {/* Value Proposition — стартовое состояние без результата */}
+        {loadingState === 'idle' && !result && (
+          <section className="w-full mt-2 text-left">
+            <h2 className="text-xl sm:text-2xl font-bold text-white leading-snug">
+              За каждым прогнозом — анализ данных
+            </h2>
+            <p className="mt-3 text-sm text-slate-400 leading-relaxed">
+              ORAKUL AI самостоятельно исследует доступные источники, собирает и систематизирует информацию о футбольных матчах, анализирует форму команд и историю встреч. На основе полученных данных сервис рассчитывает вероятности исходов и формирует собственный аналитический прогноз.
+            </p>
+
+            <h3 className="mt-6 text-base sm:text-lg font-semibold text-slate-100">
+              Комплексный анализ футбольной статистики
+            </h3>
+            <p className="mt-2 text-sm text-slate-400 leading-relaxed">
+              Статистика матчей, результаты команд, текущая форма и история личных встреч помогают составить более полную картину предстоящей игры.
+            </p>
+
+            <h3 className="mt-6 text-base sm:text-lg font-semibold text-slate-100">
+              Интеллектуальная обработка
+            </h3>
+            <p className="mt-2 text-sm text-slate-400 leading-relaxed">
+              ORAKUL AI систематизирует доступные сведения и использует собственную модель анализа для оценки возможных исходов матча.
+            </p>
+
+            <h3 className="mt-6 text-base sm:text-lg font-semibold text-slate-100">
+              Вероятности вместо догадок
+            </h3>
+            <p className="mt-2 text-sm text-slate-400 leading-relaxed">
+              Изучайте вероятности победы хозяев, ничьей и победы гостей, а также дополнительные оценки голов и тоталов.
+            </p>
+
+            <hr className="my-6 border-slate-800" />
+
+            <h3 className="text-base sm:text-lg font-semibold text-slate-100">
+              Начните бесплатно
+            </h3>
+            <p className="mt-2 text-sm text-slate-400 leading-relaxed">
+              Выберите футбольный матч и получите первый анализ ORAKUL AI бесплатно. Оцените статистику, вероятности исходов и аналитический прогноз.
+            </p>
+          </section>
+        )}
 
         {/* Loading Indicator UX */}
         {loadingState !== 'idle' && (
@@ -355,14 +380,9 @@ export default function Home() {
                   {result.usedSources.map((source, idx) => (
                     <li key={idx} className="flex items-center gap-2 text-xs sm:text-sm">
                       <span className="text-cyan-400">•</span>
-                      <a
-                        href={source.url}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-slate-300 hover:text-cyan-300 underline underline-offset-4 line-clamp-1 transition-colors"
-                      >
+                      <span className="text-slate-300 line-clamp-1">
                         {source.title || source.url}
-                      </a>
+                      </span>
                     </li>
                   ))}
                 </ul>
