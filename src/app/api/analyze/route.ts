@@ -23,6 +23,13 @@ import {
 } from '@/lib/data';
 import type { DataPack, ResearchQueryKey } from '@/lib/data';
 import type { AnalysisResult } from '@/types/analysis';
+import {
+  reserveFreeGeneration,
+  consumeFreeGeneration,
+  releaseFreeGeneration,
+} from '@/lib/supabase/free-limit';
+import { cookies } from 'next/headers';
+import { createHmac, randomUUID } from 'crypto';
 
 // Venue текущего матча в перспективе конкретной команды: team1 = currentVenue как есть,
 // team2 = зеркало (HOME ↔ AWAY). NEUTRAL/UNKNOWN остаются без изменений.
@@ -620,7 +627,8 @@ SHOTS_AGAINST_PER_GAME: [Средние броски соперника, нап�
 async function handleHockeyAnalysis(
   trimmedMatch: string,
   ydcApiKey: string,
-  keydealerApiKey: string
+  keydealerApiKey: string,
+  freeGenReservationId: string | null = null
 ) {
   const researchQuery = buildHockeyResearchQuery(trimmedMatch);
   const researchCacheKey = buildResearchCacheKey(researchQuery as any);
@@ -648,12 +656,20 @@ async function handleHockeyAnalysis(
 
       if (!initRes.ok) {
         const rawErrText = await initRes.text();
+        if (freeGenReservationId) {
+          await releaseFreeGeneration(freeGenReservationId);
+          freeGenReservationId = null;
+        }
         throw new Error(`You.com Research failed: HTTP ${initRes.status} — ${sanitizeSecrets(rawErrText)}`);
       }
 
       const initData = await initRes.json();
       taskId = initData.task_id || initData.taskId || initData.id || null;
       if (!taskId) {
+        if (freeGenReservationId) {
+          await releaseFreeGeneration(freeGenReservationId);
+          freeGenReservationId = null;
+        }
         throw new Error('You.com Research init failed: task_id was missing');
       }
 
@@ -697,10 +713,14 @@ async function handleHockeyAnalysis(
             isCompleted = true;
             break;
           }
-          if (pollStatus === 'failed' || pollStatus === 'error' || pollStatus === 'cancelled') {
-            console.log(`[HOCKEY POLL #${pollCount}] terminal status=${pollStatus}`);
-            throw new Error(`You.com Research task ${taskId} failed with status: ${pollStatus}`);
-          }
+      if (pollStatus === 'failed' || pollStatus === 'error' || pollStatus === 'cancelled') {
+        console.log(`[HOCKEY POLL #${pollCount}] terminal status=${pollStatus}`);
+        if (freeGenReservationId) {
+          await releaseFreeGeneration(freeGenReservationId);
+          freeGenReservationId = null;
+        }
+        throw new Error(`You.com Research task ${taskId} failed with status: ${pollStatus}`);
+      }
         } else {
           console.log(`[HOCKEY POLL #${pollCount}] elapsed=${elapsed}ms http=${pollHttp} ok=${pollOk}`);
         }
@@ -740,6 +760,9 @@ async function handleHockeyAnalysis(
   const rawVdpText = extractVDP(researchMarkdown);
   if (!rawVdpText || rawVdpText.trim().length === 0) {
     console.error('[ORAKUL HOCKEY] VERIFIED DATA PACK not found in research report. Aborting analysis.');
+    if (freeGenReservationId) {
+      await releaseFreeGeneration(freeGenReservationId);
+    }
     return NextResponse.json(
       { error: 'VERIFIED DATA PACK не найден в отчёте исследования. Анализ невозможен.' },
       { status: 422 }
@@ -847,6 +870,11 @@ ${truncatedReport}`;
     };
   }
 
+  if (freeGenReservationId) {
+    await releaseFreeGeneration(freeGenReservationId);
+    freeGenReservationId = null;
+  }
+
   // Format outcomes for UI compatibility:
   // Primary outcomes show 2-way Final OT/SO probabilities as key market, plus 3-way Regulation in labels/details if needed.
   // We provide outcomes representing Final Winner (incl. OT/SO) and Regulation 1X2 in clear label format.
@@ -887,6 +915,52 @@ ${truncatedReport}`;
   return NextResponse.json(responseBody);
 }
 
+const ANON_SESSION_SECRET = process.env.ANON_SESSION_SECRET;
+
+function signAnonSid(sid: string): string {
+  if (!ANON_SESSION_SECRET) {
+    throw new Error('ANON_SESSION_SECRET is not configured');
+  }
+  const sig = createHmac('sha256', ANON_SESSION_SECRET).update(sid).digest('hex').slice(0, 16);
+  return `${sid}.${sig}`;
+}
+
+export function verifyAnonSid(token: string): string | null {
+  if (!ANON_SESSION_SECRET) return null;
+  const dot = token.lastIndexOf('.');
+  if (dot < 1) return null;
+  const sid = token.slice(0, dot);
+  const sig = token.slice(dot + 1);
+  const expected = createHmac('sha256', ANON_SESSION_SECRET).update(sid).digest('hex').slice(0, 16);
+  if (sig !== expected) return null;
+  return sid;
+}
+
+async function getOrCreateAnonSessionId(): Promise<string> {
+  if (!ANON_SESSION_SECRET) {
+    throw new Error('ANON_SESSION_SECRET is not configured');
+  }
+  const cookieStore = await cookies();
+  const raw = cookieStore.get('anon_sid')?.value;
+  if (raw && typeof raw === 'string') {
+    const verified = verifyAnonSid(raw);
+    if (verified) return verified;
+  }
+  const newSid = randomUUID();
+  const signed = signAnonSid(newSid);
+  try {
+    cookieStore.set('anon_sid', signed, {
+      httpOnly: true,
+      sameSite: 'lax',
+      path: '/',
+      maxAge: 60 * 60 * 24 * 365,
+    });
+  } catch {
+    // ignore cookie set errors in non-response contexts
+  }
+  return newSid;
+}
+
 export async function POST(req: Request) {
   try {
     const { match, sport = 'football' } = await req.json();
@@ -916,11 +990,28 @@ export async function POST(req: Request) {
       );
     }
 
+    const currentDateStr = '2026 год';
+
+    const anonSessionId = await getOrCreateAnonSessionId();
+    const freeLimit = await reserveFreeGeneration(anonSessionId);
+    if (!freeLimit.allowed) {
+      if (freeLimit.reason === 'config_missing') {
+        return NextResponse.json(
+          { error: 'Service unavailable. Please try again later.' },
+          { status: 503 },
+        );
+      }
+      return NextResponse.json(
+        { status: 'auth_required', message: 'Free generation limit reached. Please sign in.' },
+        { status: 402 },
+      );
+    }
+    let freeGenReservationId: string | null = freeLimit.reservationId;
+
     if (sport === 'hockey') {
-      return await handleHockeyAnalysis(trimmedMatch, ydcApiKey, keydealerApiKey);
+      return await handleHockeyAnalysis(trimmedMatch, ydcApiKey, keydealerApiKey, freeGenReservationId);
     }
 
-    const currentDateStr = '2026 год';
     const researchQuery = matchQueryFromFreeForm(trimmedMatch);
     const researchCacheKey = buildResearchCacheKey(researchQuery);
 
@@ -1337,6 +1428,10 @@ CONFLICTS / UNCERTAINTIES
         const rawErrText = await initRes.text();
         const safeErrText = sanitizeSecrets(rawErrText);
         console.error(`You.com Research API init HTTP error: ${initRes.status}`, safeErrText);
+        // The You.com Research contract is not documented in this repository, so no init
+        // HTTP status can be treated as proof that no research task was created. The
+        // reservation is deliberately kept (no release) for both 4xx and 5xx to avoid a
+        // free-quota bypass on an ambiguous outcome.
         throw new Error(`You.com Research failed: HTTP ${initRes.status} — ${safeErrText}`);
       }
 
@@ -1346,6 +1441,8 @@ CONFLICTS / UNCERTAINTIES
       if (!taskId) {
         const safeFields = Object.keys(initData).join(', ');
         console.error('You.com Research API did not return task_id. Top fields:', safeFields);
+        // HTTP 200 means the request was accepted, and the missing known ID field is not
+        // proof that the provider did not create a task. The reservation is kept active.
         throw new Error(`You.com Research init failed: task_id was missing in response (available fields: ${safeFields})`);
       }
     } catch (initErr: any) {
@@ -1455,6 +1552,9 @@ CONFLICTS / UNCERTAINTIES
       const topFields = lastPollData ? Object.keys(lastPollData).join(', ') : 'none';
       const resultFields = lastPollData?.result ? Object.keys(lastPollData.result).join(', ') : 'none';
       console.warn('Research completed but normalized research report was empty. Available fields:', topFields, resultFields);
+      // An empty normalized report only proves that the current extraction heuristic did
+      // not recognize the content field; it is not proof that the provider returned no
+      // result. The reservation is kept active on this ambiguous outcome.
       throw new Error(`Research completed but research report content was missing or empty (available top fields: ${topFields}, result fields: ${resultFields})`);
     }
 
@@ -1639,8 +1739,15 @@ K. Финальный JSON соответствует существующему
 
     if (!vdpText || vdpText.trim().length === 0) {
       console.error('[ORAKUL] VERIFIED DATA PACK not found in research report. Aborting analysis.');
+      if (freeGenReservationId) {
+        const releaseResult = await releaseFreeGeneration(freeGenReservationId);
+        if (!releaseResult.released) {
+          console.error(`[ORAKUL] free generation reservation NOT released: reservationId=${freeGenReservationId} reason=${releaseResult.reason}`);
+        }
+        freeGenReservationId = null;
+      }
       return NextResponse.json(
-        { error: 'VERIFIED DATA PACK не найден в отчёте исследования. Анализ невозможен.' },
+        { error: 'VERIFIED DATA PACK не найден в отчёте исследования. Анализ невозможно.' },
         { status: 422 }
       );
     }
@@ -1663,6 +1770,13 @@ K. Финальный JSON соответствует существующему
 
     if (!hasSufficientVDP) {
       console.error('[ORAKUL] VERIFIED DATA PACK is empty/invalid: insufficient data for probability calculation.');
+      if (freeGenReservationId) {
+        const releaseResult = await releaseFreeGeneration(freeGenReservationId);
+        if (!releaseResult.released) {
+          console.error(`[ORAKUL] free generation reservation NOT released: reservationId=${freeGenReservationId} reason=${releaseResult.reason}`);
+        }
+        freeGenReservationId = null;
+      }
       return NextResponse.json(
         { error: 'VERIFIED DATA PACK невалиден: недостаточно данных для расчёта вероятностей.' },
         { status: 422 }
@@ -1790,6 +1904,13 @@ ${JSON.stringify(goalDistributionForLlm)}
           name: String(networkError?.name || 'Error'),
         });
         console.error('KeyDealer LLM fetch network error:', safeLLMErr);
+        if (freeGenReservationId) {
+          const releaseResult = await releaseFreeGeneration(freeGenReservationId);
+          if (!releaseResult.released) {
+            console.error(`[ORAKUL] free generation reservation NOT released: reservationId=${freeGenReservationId} reason=${releaseResult.reason}`);
+          }
+          freeGenReservationId = null;
+        }
         return NextResponse.json(
           { error: `LLM API connection error: ${safeLLMErr}` },
           { status: 502 }
@@ -1804,6 +1925,13 @@ ${JSON.stringify(goalDistributionForLlm)}
           httpStatus: chatRes.status,
           responseBodyFirst500Chars: safeErrBody.slice(0, 500),
         }));
+        if (freeGenReservationId) {
+          const releaseResult = await releaseFreeGeneration(freeGenReservationId);
+          if (!releaseResult.released) {
+            console.error(`[ORAKUL] free generation reservation NOT released: reservationId=${freeGenReservationId} reason=${releaseResult.reason}`);
+          }
+          freeGenReservationId = null;
+        }
         return NextResponse.json(
           { error: `LLM API error: HTTP ${chatRes.status} — ${safeErrBody}` },
           { status: 502 }
@@ -1846,6 +1974,13 @@ ${JSON.stringify(goalDistributionForLlm)}
         if (llmAttempt === 1) {
           console.log('[LLM] JSON retry failed');
         }
+        if (freeGenReservationId) {
+          const releaseResult = await releaseFreeGeneration(freeGenReservationId);
+          if (!releaseResult.released) {
+            console.error(`[ORAKUL] free generation reservation NOT released: reservationId=${freeGenReservationId} reason=${releaseResult.reason}`);
+          }
+          freeGenReservationId = null;
+        }
         return NextResponse.json(
           { error: 'LLM response was not valid JSON.' },
           { status: 502 }
@@ -1860,6 +1995,13 @@ ${JSON.stringify(goalDistributionForLlm)}
     const contract = buildAnalysisContract(rawParsed);
     if (!contract) {
       console.log('[ORAKUL DIAGNOSTIC] LLM returned non-object payload:', JSON.stringify(String(rawParsed).slice(0, 300)));
+      if (freeGenReservationId) {
+        const releaseResult = await releaseFreeGeneration(freeGenReservationId);
+        if (!releaseResult.released) {
+          console.error(`[ORAKUL] free generation reservation NOT released: reservationId=${freeGenReservationId} reason=${releaseResult.reason}`);
+        }
+        freeGenReservationId = null;
+      }
       return NextResponse.json(
         { error: 'LLM response had an unexpected structure.' },
         { status: 502 }
@@ -1894,6 +2036,13 @@ ${JSON.stringify(goalDistributionForLlm)}
         topLevelKeys: isRecord(rawParsed) ? Object.keys(rawParsed).join(', ') : 'n/a',
         hasStatus: isRecord(rawParsed) ? String(rawParsed.status) : 'n/a',
       }));
+      if (freeGenReservationId) {
+        const releaseResult = await releaseFreeGeneration(freeGenReservationId);
+        if (!releaseResult.released) {
+          console.error(`[ORAKUL] free generation reservation NOT released: reservationId=${freeGenReservationId} reason=${releaseResult.reason}`);
+        }
+        freeGenReservationId = null;
+      }
       return NextResponse.json(
         { error: `LLM response failed validation: ${validationError}` },
         { status: 502 }
@@ -1904,9 +2053,26 @@ ${JSON.stringify(goalDistributionForLlm)}
     const publicProbabilities = response.probabilities.outcomes.map((outcome: { value: string }) => toProbabilityNumber(outcome.value));
     console.log('[ORAKUL DIAGNOSTIC] Public Response probabilities:', `team1=${publicProbabilities[0]} draw=${publicProbabilities[1]} team2=${publicProbabilities[2]}`);
 
+    const consumeResult = await consumeFreeGeneration(freeGenReservationId);
+    if (!consumeResult.success) {
+      console.error('[ORAKUL] CRITICAL: consumeFreeGeneration failed after successful final response. Reservation left unconsumed to prevent double-use. reservationId:', freeGenReservationId);
+      return NextResponse.json(
+        { error: 'Internal accounting error. The result was not delivered to avoid unaccounted free generation.' },
+        { status: 500 }
+      );
+    }
+    freeGenReservationId = null;
     return NextResponse.json(response);
   } catch (error: any) {
-    const safeErrorMsg = sanitizeSecrets(error?.message || String(error));
+    const msg = error?.message || String(error);
+    if (msg.includes('ANON_SESSION_SECRET is not configured')) {
+      console.error('[ORAKUL] ANON_SESSION_SECRET not configured');
+      return NextResponse.json(
+        { error: 'Service unavailable. Please try again later.' },
+        { status: 503 },
+      );
+    }
+    const safeErrorMsg = sanitizeSecrets(msg);
     console.error('Unhandled error in /api/analyze:', safeErrorMsg);
     return NextResponse.json(
       { error: `Unhandled server error: ${safeErrorMsg}` },

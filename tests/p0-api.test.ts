@@ -1,9 +1,12 @@
 // P0-регрессионные тесты API /api/analyze (Tests 11–12) — текущее поведение.
 // Сеть полностью замокана (globalThis.fetch): You.com init+poll, KeyDealer chat.
 // Реальные вызовы, .env, YDC_API_KEY/KEYDEALER_API_KEY не используются.
+// NOTE: we do NOT import { POST } statically — we dynamically import it AFTER mock.module in beforeEach to ensure the mock intercepts the free-limit import inside route.ts.
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { POST, buildGoalDistributionInput } from '../src/app/api/analyze/route';
+import { mock } from 'node:test';
+import fs from 'node:fs';
+import path from 'node:path';
 import { parseVDP } from '../src/lib/vdp-parser';
 import { calculateGoalDistribution } from '../src/lib/goal-distribution';
 import {
@@ -13,7 +16,105 @@ import {
 } from './helpers/fixtures';
 import { clearResearchCacheForTests } from '../src/lib/data/research-cache';
 
+// We will assign these after dynamic import in beforeEach
+let POST: any;
+let buildGoalDistributionInput: any;
+
 type FetchCall = { url: string; method: string; body?: string };
+
+// Per-test cookie jar shared between makeRequest (writer) and the next/headers mock (reader).
+// This models browser cookie persistence: set-cookie from response updates the jar,
+// subsequent requests send the stored cookie back.
+const testCookieJar: Map<string, string> = new Map();
+
+function parseCookiesFromHeader(header: string | undefined): Map<string, string> {
+  const m = new Map<string, string>();
+  if (!header) return m;
+  for (const part of header.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq > 0) m.set(part.slice(0, eq).trim(), part.slice(eq + 1).trim());
+  }
+  return m;
+}
+
+function setCurrentRequestCookies(req: Request) {
+  issuedSetCookies = [];
+  testCookieJar.clear();
+  const hdr = req.headers.get('cookie') || '';
+  for (const [k, v] of parseCookiesFromHeader(hdr)) testCookieJar.set(k, v);
+}
+
+function applySetCookieToJar(res: Response) {
+  for (const raw of res.headers.getSetCookie?.() ?? []) {
+    const semi = raw.indexOf(';');
+    const pair = semi > 0 ? raw.slice(0, semi) : raw;
+    const eq = pair.indexOf('=');
+    if (eq > 0) testCookieJar.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
+  }
+  // Merge cookies the route issued via the next/headers mock (captured as bare name=value strings).
+  for (const raw of issuedSetCookies) {
+    const eq = raw.indexOf('=');
+    if (eq > 0) testCookieJar.set(raw.slice(0, eq).trim(), raw.slice(eq + 1).trim());
+  }
+  issuedSetCookies = [];
+}
+
+function buildCookieHeader(): string {
+  return [...testCookieJar.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+function clearCookieStore(): void {
+  testCookieJar.clear();
+}
+
+// Cookies the route issues via cookies().set(...) during a request.
+// In real Next.js these become Set-Cookie headers on the outgoing response; the
+// mock captures them so postAndApplyCookies can surface them the same way.
+let issuedSetCookies: string[] = [];
+
+function mockCookieKit() {
+  return {
+    get(name: string) {
+      const v = testCookieJar.get(name);
+      return v !== undefined ? { name, value: v } : undefined;
+    },
+    set(name: string, value: string) {
+      issuedSetCookies.push(`${name}=${value}`);
+    },
+    has(name: string) {
+      return testCookieJar.has(name);
+    },
+    delete(name: string) {
+      testCookieJar.delete(name);
+    },
+    getAll() {
+      return Array.from(testCookieJar.entries()).map(([name, value]) => ({ name, value }));
+    },
+    keys() {
+      return testCookieJar.keys();
+    },
+  };
+}
+
+// Stateful free-limit stub: mirrors the real ledger semantics for one generation per fingerprint.
+// Raw fingerprints come from route.ts as anon session ids (uuid).
+function createStatefulFreeLimit() {
+  const consumed = new Set<string>();
+  let seq = 0;
+  return {
+    reserveFreeGeneration: async (rawFingerprint: string) => {
+      const fingerprint = String(rawFingerprint).trim().toLowerCase().replace(/\s+/g, ' ');
+      if (consumed.has(fingerprint)) {
+        return { allowed: false, reason: 'limit_exhausted' as const };
+      }
+      consumed.add(fingerprint);
+      seq += 1;
+      return { allowed: true, reservationId: `test-res-${seq}` };
+    },
+    consumeFreeGeneration: async (_reservationId: string) => ({ success: true }),
+    releaseFreeGeneration: async (_reservationId: string) => ({ released: true, deletedCount: 1 as const }),
+  };
+}
 
 function makeMockFetch(
   reportText: string,
@@ -58,12 +159,26 @@ function makeMockFetch(
   }) as typeof fetch;
 }
 
-function makeRequest(body: unknown): Request {
+function makeRequest(body: unknown, overrideSid?: string): Request {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (overrideSid !== undefined) {
+    headers['cookie'] = overrideSid ? `anon_sid=${overrideSid}` : '';
+  } else {
+    const jar = buildCookieHeader();
+    if (jar) headers['cookie'] = jar;
+  }
   return new Request('http://localhost/api/analyze', {
     method: 'POST',
     body: JSON.stringify(body),
-    headers: { 'Content-Type': 'application/json' },
+    headers,
   });
+}
+
+async function postAndApplyCookies(postFn: typeof POST, req: Request): Promise<Response> {
+  setCurrentRequestCookies(req);
+  const res = await postFn(req);
+  applySetCookieToJar(res);
+  return res;
 }
 
 describe('P0 API /api/analyze (current behavior)', () => {
@@ -74,26 +189,48 @@ describe('P0 API /api/analyze (current behavior)', () => {
   const realErr = console.error;
   const realWarn = console.warn;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     calls = [];
     logs = [];
     clearResearchCacheForTests();
     // Изолируем от реального окружения: только тестовые ключи, никакого .env
     process.env.YDC_API_KEY = 'ydc_live_p0test';
     process.env.KEYDEALER_API_KEY = 'kd_live_p0test';
+    process.env.ANON_SESSION_SECRET = 'test-anon-session-secret-p0';
     // route.ts пишет большие diagnostic-логи — гасим на время теста
     console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
     console.error = () => {};
     console.warn = () => {};
+    // IMPORTANT: mock BEFORE dynamic import of the route module so that route.ts sees the mocked free-limit
+    // Use namedExports to satisfy current @types/node; runtime will show deprecation but still mock correctly.
+    clearCookieStore();
+    mock.module('next/headers', {
+      namedExports: {
+        cookies: async () => mockCookieKit(),
+      },
+    });
+    mock.module('@/lib/supabase/free-limit', {
+      namedExports: {
+        reserveFreeGeneration: async () => ({ allowed: true, reservationId: 'test-res-1' }),
+        consumeFreeGeneration: async () => ({ success: true }),
+        releaseFreeGeneration: async () => ({ released: true, deletedCount: 1 as const }),
+      },
+    });
+    // Dynamically import AFTER the mock is in place — this ensures production route.ts loads the mock
+    const mod = await import('../src/app/api/analyze/route');
+    POST = mod.POST;
+    buildGoalDistributionInput = mod.buildGoalDistributionInput;
   });
 
   afterEach(() => {
     globalThis.fetch = realFetch;
     delete process.env.YDC_API_KEY;
     delete process.env.KEYDEALER_API_KEY;
+    delete process.env.ANON_SESSION_SECRET;
     console.log = realLog;
     console.error = realErr;
     console.warn = realWarn;
+    mock.restoreAll();
   });
 
   test('T11: report without VERIFIED DATA PACK marker — 422', async () => {
@@ -102,7 +239,7 @@ describe('P0 API /api/analyze (current behavior)', () => {
       buildLlmContractResponse({ team1: 40, draw: 27, team2: 33 }),
       calls
     );
-    const res = await POST(makeRequest({ match: 'Team A vs Team B' }));
+    const res = await postAndApplyCookies(POST, makeRequest({ match: 'Team A vs Team B' }));
     assert.equal(res.status, 422);
     const body = await res.json();
     assert.ok(String(body.error).includes('VERIFIED DATA PACK'));
@@ -127,7 +264,7 @@ describe('P0 API /api/analyze (current behavior)', () => {
       buildLlmContractResponse({ team1: 40, draw: 27, team2: 33 }),
       calls
     );
-    const res = await POST(makeRequest({ match: 'Team A vs Team B' }));
+    const res = await postAndApplyCookies(POST, makeRequest({ match: 'Team A vs Team B' }));
     assert.equal(res.status, 422);
     const body = await res.json();
     assert.ok(String(body.error).includes('недостаточно данных'));
@@ -136,7 +273,7 @@ describe('P0 API /api/analyze (current behavior)', () => {
 
   test('T11c: missing match field — 400', async () => {
     globalThis.fetch = makeMockFetch('', '', calls);
-    const res = await POST(makeRequest({}));
+    const res = await postAndApplyCookies(POST, makeRequest({}));
     assert.equal(res.status, 400);
     const body = await res.json();
     assert.ok(String(body.error).includes('матч'));
@@ -148,7 +285,7 @@ describe('P0 API /api/analyze (current behavior)', () => {
     const llmProbabilities = { team1: 45, draw: 25, team2: 30 };
     globalThis.fetch = makeMockFetch(report, buildLlmContractResponse(llmProbabilities), calls);
 
-    const res = await POST(makeRequest({ match: 'Team A vs Team B' }));
+    const res = await postAndApplyCookies(POST, makeRequest({ match: 'Team A vs Team B' }));
     assert.equal(res.status, 200);
     const body = await res.json();
 
@@ -175,7 +312,7 @@ describe('P0 API /api/analyze (current behavior)', () => {
     const report = buildResearchReportWithVdp(buildFullVdp());
     globalThis.fetch = makeMockFetch(report, buildLlmContractResponse({ team1: 45, draw: 25, team2: 30 }), calls);
 
-    const res = await POST(makeRequest({ match: 'Team A vs Team B' }));
+    const res = await postAndApplyCookies(POST, makeRequest({ match: 'Team A vs Team B' }));
     assert.equal(res.status, 200);
     const body = await res.json();
 
@@ -270,11 +407,11 @@ describe('P0 API /api/analyze (current behavior)', () => {
   test('T15: cache HIT skips Research while Goal Distribution remains local', async () => {
     const report = buildResearchReportWithVdp(buildFullVdp());
     globalThis.fetch = makeMockFetch(report, buildLlmContractResponse({ team1: 45, draw: 25, team2: 30 }), calls);
-    assert.equal((await POST(makeRequest({ match: 'Team A vs Team B' }))).status, 200);
+    assert.equal((await postAndApplyCookies(POST, makeRequest({ match: 'Team A vs Team B' }))).status, 200);
 
     calls.length = 0;
     logs = [];
-    assert.equal((await POST(makeRequest({ match: 'Team A vs Team B' }))).status, 200);
+    assert.equal((await postAndApplyCookies(POST, makeRequest({ match: 'Team A vs Team B' }))).status, 200);
     assert.equal(calls.filter((call) => call.url.includes('api.you.com')).length, 0);
     assert.ok(logs.some((line) => line.includes('[ORAKUL DIAGNOSTIC] Goal Distribution:')));
   });
@@ -283,7 +420,7 @@ describe('P0 API /api/analyze (current behavior)', () => {
     const report = buildResearchReportWithVdp(buildFullVdp());
     globalThis.fetch = makeMockFetch(report, buildLlmContractResponse({ team1: 99, draw: 1, team2: 0 }), calls);
 
-    const res = await POST(makeRequest({ match: 'Team A vs Team B' }));
+    const res = await postAndApplyCookies(POST, makeRequest({ match: 'Team A vs Team B' }));
     assert.equal(res.status, 200);
 
     const llmCall = calls.find((call) => call.url === 'https://api.keydealer.ru/v1/chat/completions');
@@ -332,7 +469,7 @@ describe('P0 API /api/analyze (current behavior)', () => {
     const report = buildResearchReportWithVdp(buildFullVdp());
     globalThis.fetch = makeMockFetch(report, buildLlmContractResponse({ team1: 45, draw: 25, team2: 30 }), calls);
 
-    assert.equal((await POST(makeRequest({ match: 'Team A vs Team B' }))).status, 200);
+    assert.equal((await postAndApplyCookies(POST, makeRequest({ match: 'Team A vs Team B' }))).status, 200);
     assert.equal(calls.filter((call) => call.url === 'https://api.keydealer.ru/v1/chat/completions').length, 1);
   });
 
@@ -344,7 +481,7 @@ describe('P0 API /api/analyze (current behavior)', () => {
       calls,
     );
 
-    const res = await POST(makeRequest({ match: 'Россия — Иран' }));
+    const res = await postAndApplyCookies(POST, makeRequest({ match: 'Россия — Иран' }));
     assert.equal(res.status, 200);
     assert.equal(calls.filter((call) => call.url === 'https://api.keydealer.ru/v1/chat/completions').length, 2);
     assert.equal(calls.filter((call) => call.url.includes('api.you.com')).length, 2);
@@ -359,7 +496,7 @@ describe('P0 API /api/analyze (current behavior)', () => {
     const malformed = '{"status":"success","explanation":{"factors":["обрезано...';
     globalThis.fetch = makeMockFetch(report, [malformed, malformed], calls);
 
-    const res = await POST(makeRequest({ match: 'Россия — Иран' }));
+    const res = await postAndApplyCookies(POST, makeRequest({ match: 'Россия — Иран' }));
     assert.equal(res.status, 502);
     assert.deepEqual(await res.json(), { error: 'LLM response was not valid JSON.' });
     assert.equal(calls.filter((call) => call.url === 'https://api.keydealer.ru/v1/chat/completions').length, 2);
@@ -370,7 +507,7 @@ describe('P0 API /api/analyze (current behavior)', () => {
     const report = buildResearchReportWithVdp(buildFullVdp());
     globalThis.fetch = makeMockFetch(report, buildLlmContractResponse({ team1: 45, draw: 25, team2: 30 }), calls, 500);
 
-    const res = await POST(makeRequest({ match: 'Team A vs Team B' }));
+    const res = await postAndApplyCookies(POST, makeRequest({ match: 'Team A vs Team B' }));
     assert.equal(res.status, 502);
     assert.match(String((await res.json()).error), /HTTP 500/);
     assert.equal(calls.filter((call) => call.url === 'https://api.keydealer.ru/v1/chat/completions').length, 1);
@@ -380,7 +517,7 @@ describe('P0 API /api/analyze (current behavior)', () => {
     const report = buildResearchReportWithVdp(buildFullVdp());
     globalThis.fetch = makeMockFetch(report, '', calls);
 
-    const res = await POST(makeRequest({ match: 'Team A vs Team B' }));
+    const res = await postAndApplyCookies(POST, makeRequest({ match: 'Team A vs Team B' }));
     assert.equal(res.status, 502);
     assert.deepEqual(await res.json(), { error: 'LLM response was not valid JSON.' });
     assert.equal(calls.filter((call) => call.url === 'https://api.keydealer.ru/v1/chat/completions').length, 1);
@@ -394,9 +531,447 @@ describe('P0 API /api/analyze (current behavior)', () => {
       calls,
     );
 
-    const res = await POST(makeRequest({ match: 'Team A vs Team B' }));
+    const res = await postAndApplyCookies(POST, makeRequest({ match: 'Team A vs Team B' }));
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.deepEqual(body.probabilities.outcomes.map((outcome: { value: string }) => outcome.value), ['59%', '15%', '26%']);
+  });
+
+  test('T22: consume failure after success path returns 500 and does not deliver 200', async () => {
+    // Force fresh module eval under failing consume mock using cache-bust query.
+    // beforeEach success mock + prior route load must not leak.
+    mock.restoreAll();
+    testCookieJar.clear();
+    process.env.ANON_SESSION_SECRET = 'test-anon-session-secret-p0';
+    mock.module('next/headers', {
+      namedExports: {
+        cookies: async () => ({
+          get: async (name: string) => {
+            const value = testCookieJar.get(name);
+            return value ? { name, value } : undefined;
+          },
+          set: async (name: string, value: string) => { testCookieJar.set(name, value); },
+          has: async (name: string) => testCookieJar.has(name),
+          delete: async (name: string) => { testCookieJar.delete(name); },
+          getAll: async () => [...testCookieJar.entries()].map(([name, value]) => ({ name, value })),
+          keys: async () => testCookieJar.keys(),
+        }),
+      },
+    });
+    mock.module('@/lib/supabase/free-limit', {
+      namedExports: {
+        reserveFreeGeneration: async () => ({ allowed: true, reservationId: 'test-res-consume-fail' }),
+        consumeFreeGeneration: async () => ({ success: false }),
+        releaseFreeGeneration: async () => ({ released: true, deletedCount: 1 as const }),
+      },
+    });
+    const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
+    const { POST: POSTForFail } = await import(`../src/app/api/analyze/route?cb=${bust}`);
+
+    const report = buildResearchReportWithVdp(buildFullVdp());
+    globalThis.fetch = makeMockFetch(report, buildLlmContractResponse({ team1: 40, draw: 27, team2: 33 }), calls);
+
+    const res = await postAndApplyCookies(POSTForFail, makeRequest({ match: 'Team A vs Team B' }));
+    assert.equal(res.status, 500);
+    const body = await res.json();
+    assert.ok(String(body.error).includes('Internal accounting error'));
+    assert.notEqual(res.status, 200);
+  });
+
+  test('T23: two different anon sids each get their own free generation (no cross-sid sharing)', async () => {
+    const report = buildResearchReportWithVdp(buildFullVdp());
+    globalThis.fetch = makeMockFetch(report, buildLlmContractResponse({ team1: 40, draw: 27, team2: 33 }), calls);
+    const sid1 = 'sid-test-1';
+    const sid2 = 'sid-test-2';
+    const res1 = await postAndApplyCookies(POST, makeRequest({ match: 'Team X vs Team Y' }, sid1));
+    const res2 = await postAndApplyCookies(POST, makeRequest({ match: 'Team X vs Team Y' }, sid2));
+    assert.equal(res1.status, 200);
+    assert.equal(res2.status, 200);
+  });
+
+  test('T24: same anon sid second request gets 402 after first consume', async () => {
+    // Drop the beforeEach mocks so this test can re-mock 'free-limit' with a stateful stub
+    // (same pattern as T22/T26/T28). The next/headers mock must then be reinstalled.
+    mock.restoreAll();
+    testCookieJar.clear();
+    process.env.ANON_SESSION_SECRET = 'test-anon-session-secret-p0';
+    // Reuse the same sync cookie mock as beforeEach: route reads cookies() synchronously
+    // (route.ts getOrCreateAnonSessionId), so the mock must return plain values, not Promises.
+    mock.module('next/headers', {
+      namedExports: {
+        cookies: async () => mockCookieKit(),
+      },
+    });
+    // Stateful ledger stub localized to this test: it consumes the fingerprint once, so a
+    // repeated request from the same signed session must be rejected. Installed BEFORE the
+    // fresh route import so production route.ts binds the stateful mock.
+    const statefulFreeLimit = createStatefulFreeLimit();
+    mock.module('@/lib/supabase/free-limit', {
+      namedExports: {
+        reserveFreeGeneration: statefulFreeLimit.reserveFreeGeneration,
+        consumeFreeGeneration: statefulFreeLimit.consumeFreeGeneration,
+        releaseFreeGeneration: statefulFreeLimit.releaseFreeGeneration,
+      },
+    });
+    const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
+    const { POST: POSTStateful } = await import(`../src/app/api/analyze/route?cb=${bust}`);
+
+    const report = buildResearchReportWithVdp(buildFullVdp());
+    globalThis.fetch = makeMockFetch(report, buildLlmContractResponse({ team1: 40, draw: 27, team2: 33 }), calls);
+    // Reuse the SAME signed anon_sid cookie across both requests (persisted via the cookie jar).
+    // The first request is approved and consumed; the second must be rejected as quota-exhausted.
+    const res1 = await postAndApplyCookies(POSTStateful, makeRequest({ match: 'Team A vs Team B' }));
+    assert.equal(res1.status, 200);
+    const res2 = await postAndApplyCookies(POSTStateful, makeRequest({ match: 'Team A vs Team B' }));
+    assert.equal(res2.status, 402);
+    const body2 = await res2.json();
+    assert.equal(body2.status, 'auth_required');
+  });
+
+  test('T25: client cannot spoof sid via body (sid from httpOnly cookie only)', async () => {
+    const report = buildResearchReportWithVdp(buildFullVdp());
+    globalThis.fetch = makeMockFetch(report, buildLlmContractResponse({ team1: 40, draw: 27, team2: 33 }), calls);
+    const spoofSid = 'spoofed-sid';
+    const bodyWithSid = { match: 'Team A vs Team B', anon_sid: spoofSid };
+    const res = await postAndApplyCookies(POST, makeRequest(bodyWithSid));
+    assert.equal(res.status, 200);
+  });
+
+  test('T26: config_missing from reserve yields 503', async () => {
+    mock.restoreAll();
+    testCookieJar.clear();
+    process.env.ANON_SESSION_SECRET = 'test-anon-session-secret-p0';
+    mock.module('next/headers', {
+      namedExports: {
+        cookies: async () => ({
+          get: async (name: string) => {
+            const value = testCookieJar.get(name);
+            return value ? { name, value } : undefined;
+          },
+          set: async (name: string, value: string) => { testCookieJar.set(name, value); },
+          has: async (name: string) => testCookieJar.has(name),
+          delete: async (name: string) => { testCookieJar.delete(name); },
+          getAll: async () => [...testCookieJar.entries()].map(([name, value]) => ({ name, value })),
+          keys: async () => testCookieJar.keys(),
+        }),
+      },
+    });
+    mock.module('@/lib/supabase/free-limit', {
+      namedExports: {
+        reserveFreeGeneration: async () => ({ allowed: false, reason: 'config_missing' as const }),
+        consumeFreeGeneration: async () => ({ success: false }),
+        releaseFreeGeneration: async () => ({ released: true, deletedCount: 1 as const }),
+      },
+    });
+    const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
+    const { POST: POSTForCfg } = await import(`../src/app/api/analyze/route?cb=${bust}`);
+    const res = await postAndApplyCookies(POSTForCfg, makeRequest({ match: 'Team A vs Team B' }));
+    assert.equal(res.status, 503);
+  });
+
+  test('T27: forged/unsigned anon_sid is rejected and replaced with signed session', async () => {
+    globalThis.fetch = makeMockFetch(
+      buildResearchReportWithVdp(buildFullVdp()),
+      buildLlmContractResponse({ team1: 59, draw: 15, team2: 26 }),
+      calls
+    );
+    const res = await postAndApplyCookies(POST, makeRequest({ match: 'Team A vs Team B' }, 'forged-unsigned-sid'));
+    assert.equal(res.status, 200);
+    // The mocked next/headers does not surface a real Set-Cookie response header; the cookie-store
+    // write is captured by the mock and applied to the jar, so verify the replacement there.
+    const signedValue = testCookieJar.get('anon_sid');
+    assert.ok(signedValue, 'server must write a replacement anon_sid cookie');
+    assert.notEqual(signedValue, 'forged-unsigned-sid', 'forged sid must not be reused');
+    assert.ok(signedValue!.includes('.'), 'stored sid must be HMAC-signed (uuid.signature)');
+  });
+
+  test('T28: missing ANON_SESSION_SECRET yields 503', async () => {
+    mock.restoreAll();
+    testCookieJar.clear();
+    delete process.env.ANON_SESSION_SECRET;
+    mock.module('next/headers', {
+      namedExports: {
+        cookies: async () => ({
+          get: async () => undefined,
+          set: async () => {},
+          has: async () => false,
+          delete: async () => {},
+          getAll: async () => [],
+          keys: async () => new Set(),
+        }),
+      },
+    });
+    mock.module('@/lib/supabase/free-limit', {
+      namedExports: {
+        reserveFreeGeneration: async () => ({ allowed: true, reservationId: 'x' }),
+        consumeFreeGeneration: async () => ({ success: true }),
+        releaseFreeGeneration: async () => ({ released: true, deletedCount: 1 as const }),
+      },
+    });
+    const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
+    const { POST: POSTNoSecret } = await import(`../src/app/api/analyze/route?cb=${bust}`);
+    globalThis.fetch = makeMockFetch(
+      buildResearchReportWithVdp('Team A vs Team B'),
+      buildLlmContractResponse({ team1: 59, draw: 15, team2: 26 }),
+      calls
+    );
+    const res = await postAndApplyCookies(POSTNoSecret, makeRequest({ match: 'Team A vs Team B' }));
+    assert.equal(res.status, 503);
+  });
+
+  test('T29: Football Research init HTTP 4xx does NOT release (no proven no-task guarantee)', async () => {
+    // The You.com Research contract is not documented in this repository, so even a 4xx
+    // init response cannot prove that no research task was created. The reservation is
+    // deliberately kept to avoid a free-quota bypass on an ambiguous outcome.
+    mock.restoreAll();
+    testCookieJar.clear();
+    process.env.ANON_SESSION_SECRET = 'test-anon-session-secret-p0';
+    mock.module('next/headers', {
+      namedExports: {
+        cookies: async () => mockCookieKit(),
+      },
+    });
+    const released: string[] = [];
+    const reserved: string[] = [];
+    mock.module('@/lib/supabase/free-limit', {
+      namedExports: {
+        reserveFreeGeneration: async (fp: string) => {
+          reserved.push(fp);
+          return { allowed: true, reservationId: 'test-res-t29' };
+        },
+        consumeFreeGeneration: async () => ({ success: true }),
+        releaseFreeGeneration: async (id: string) => {
+          released.push(id);
+          return { released: true, deletedCount: 1 };
+        },
+      },
+    });
+    const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
+    const { POST: POSTT29 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
+
+    globalThis.fetch = (async (u: any, init?: any) => {
+      const url = String(u);
+      if (url === 'https://api.you.com/v1/research' && init?.method === 'POST') {
+        return new Response('bad request', { status: 400 });
+      }
+      throw new Error('unexpected fetch in T29: ' + url);
+    }) as typeof fetch;
+
+    const res = await postAndApplyCookies(POSTT29, makeRequest({ match: 'Team A vs Team B' }));
+    assert.equal(res.status, 500);
+    assert.notEqual(res.status, 200);
+    assert.equal(reserved.length, 1, 'reservation must be created before Research');
+    assert.equal(released.length, 0, 'reservation must NOT be released on ambiguous 4xx (no proven no-task guarantee)');
+  });
+
+  test('T30: Football Research init HTTP 5xx does NOT release (ambiguous outcome)', async () => {
+    // 5xx gateway/timeout is ambiguous: the provider may have accepted the task before the
+    // response was lost. To avoid a free-quota bypass the reservation is deliberately kept.
+    mock.restoreAll();
+    testCookieJar.clear();
+    process.env.ANON_SESSION_SECRET = 'test-anon-session-secret-p0';
+    mock.module('next/headers', {
+      namedExports: {
+        cookies: async () => mockCookieKit(),
+      },
+    });
+    const released: string[] = [];
+    mock.module('@/lib/supabase/free-limit', {
+      namedExports: {
+        reserveFreeGeneration: async () => ({ allowed: true, reservationId: 'test-res-t30' }),
+        consumeFreeGeneration: async () => ({ success: true }),
+        releaseFreeGeneration: async (id: string) => {
+          released.push(id);
+          return { released: true, deletedCount: 1 };
+        },
+      },
+    });
+    const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
+    const { POST: POSTT30 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
+
+    globalThis.fetch = (async (u: any, init?: any) => {
+      const url = String(u);
+      if (url === 'https://api.you.com/v1/research' && init?.method === 'POST') {
+        return new Response('upstream', { status: 502 });
+      }
+      throw new Error('unexpected fetch in T30: ' + url);
+    }) as typeof fetch;
+
+    const res = await postAndApplyCookies(POSTT30, makeRequest({ match: 'Team A vs Team B' }));
+    assert.equal(res.status, 500);
+    assert.notEqual(res.status, 200);
+    assert.equal(released.length, 0, 'reservation must NOT be released on ambiguous 5xx');
+  });
+
+  test('T31: Football Research init HTTP 408 does NOT release (ambiguous request-timeout)', async () => {
+    // 408 may be returned after the provider accepted the request, so it is not proof that
+    // no task was created. The reservation must stay active.
+    mock.restoreAll();
+    testCookieJar.clear();
+    process.env.ANON_SESSION_SECRET = 'test-anon-session-secret-p0';
+    mock.module('next/headers', {
+      namedExports: {
+        cookies: async () => mockCookieKit(),
+      },
+    });
+    const released: string[] = [];
+    mock.module('@/lib/supabase/free-limit', {
+      namedExports: {
+        reserveFreeGeneration: async () => ({ allowed: true, reservationId: 'test-res-t31' }),
+        consumeFreeGeneration: async () => ({ success: true }),
+        releaseFreeGeneration: async (id: string) => {
+          released.push(id);
+          return { released: true, deletedCount: 1 };
+        },
+      },
+    });
+    const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
+    const { POST: POSTT31 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
+
+    globalThis.fetch = (async (u: any, init?: any) => {
+      const url = String(u);
+      if (url === 'https://api.you.com/v1/research' && init?.method === 'POST') {
+        return new Response('timeout', { status: 408 });
+      }
+      throw new Error('unexpected fetch in T31: ' + url);
+    }) as typeof fetch;
+
+    const res = await postAndApplyCookies(POSTT31, makeRequest({ match: 'Team A vs Team B' }));
+    assert.equal(res.status, 500);
+    assert.notEqual(res.status, 200);
+    assert.equal(released.length, 0, 'reservation must NOT be released on ambiguous 408');
+  });
+
+  test('T32: Football Research init HTTP 200 without task ID does NOT release (no-proof-no-task)', async () => {
+    // A 200 response with { status: "ok" } was accepted by the provider; the missing known
+    // ID field is not proof that no task was created, so the reservation stays active.
+    mock.restoreAll();
+    testCookieJar.clear();
+    process.env.ANON_SESSION_SECRET = 'test-anon-session-secret-p0';
+    mock.module('next/headers', {
+      namedExports: {
+        cookies: async () => mockCookieKit(),
+      },
+    });
+    const released: string[] = [];
+    mock.module('@/lib/supabase/free-limit', {
+      namedExports: {
+        reserveFreeGeneration: async () => ({ allowed: true, reservationId: 'test-res-t32' }),
+        consumeFreeGeneration: async () => ({ success: true }),
+        releaseFreeGeneration: async (id: string) => {
+          released.push(id);
+          return { released: true, deletedCount: 1 };
+        },
+      },
+    });
+    const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
+    const { POST: POSTT32 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
+
+    globalThis.fetch = (async (u: any, init?: any) => {
+      const url = String(u);
+      if (url === 'https://api.you.com/v1/research' && init?.method === 'POST') {
+        return new Response(JSON.stringify({ status: 'ok' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      throw new Error('unexpected fetch in T32: ' + url);
+    }) as typeof fetch;
+
+    const res = await postAndApplyCookies(POSTT32, makeRequest({ match: 'Team A vs Team B' }));
+    assert.equal(res.status, 500);
+    assert.notEqual(res.status, 200);
+    assert.equal(released.length, 0, 'reservation must NOT be released when task ID is unrecognized');
+  });
+
+  test('T33: terminal completed with unrecognized non-empty report field does NOT release', async () => {
+    // The provider returns { status: "completed", report: "non-empty report" } where the
+    // non-empty content lives in a field ("report") the extraction heuristic does not read.
+    // candidateContent therefore resolves to undefined, the normalized report is empty, and
+    // that ambiguity is no proof that no result was produced -> the reservation stays active.
+    mock.restoreAll();
+    testCookieJar.clear();
+    process.env.ANON_SESSION_SECRET = 'test-anon-session-secret-p0';
+    mock.module('next/headers', {
+      namedExports: {
+        cookies: async () => mockCookieKit(),
+      },
+    });
+    const released: string[] = [];
+    mock.module('@/lib/supabase/free-limit', {
+      namedExports: {
+        reserveFreeGeneration: async () => ({ allowed: true, reservationId: 'test-res-t33' }),
+        consumeFreeGeneration: async () => ({ success: true }),
+        releaseFreeGeneration: async (id: string) => {
+          released.push(id);
+          return { released: true, deletedCount: 1 };
+        },
+      },
+    });
+    const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
+    const { POST: POSTT33 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
+
+    globalThis.fetch = (async (u: any, init?: any) => {
+      const url = String(u);
+      if (url === 'https://api.you.com/v1/research' && init?.method === 'POST') {
+        return new Response(JSON.stringify({ task_id: 'task-t33' }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      if (url.startsWith('https://api.you.com/v1/research/')) {
+        return new Response(
+          JSON.stringify({ status: 'completed', report: 'non-empty report' }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      throw new Error('unexpected fetch in T33: ' + url);
+    }) as typeof fetch;
+
+    const res = await postAndApplyCookies(POSTT33, makeRequest({ match: 'Team A vs Team B' }));
+    assert.equal(res.status, 500);
+    assert.notEqual(res.status, 200);
+    assert.equal(released.length, 0, 'reservation must NOT be released when report content field is unrecognized');
+  });
+
+  test('T34: failed release is logged but keeps the original HTTP response and is not retried', async () => {
+    // VDP missing -> route releases the reservation once and must keep returning 422.
+    // The release itself fails (db_error): the route must NOT retry and must NOT change the status.
+    mock.restoreAll();
+    testCookieJar.clear();
+    process.env.ANON_SESSION_SECRET = 'test-anon-session-secret-p0';
+    mock.module('next/headers', {
+      namedExports: {
+        cookies: async () => mockCookieKit(),
+      },
+    });
+    const releaseAttempts: string[] = [];
+    mock.module('@/lib/supabase/free-limit', {
+      namedExports: {
+        reserveFreeGeneration: async () => ({ allowed: true, reservationId: 'test-res-t34' }),
+        consumeFreeGeneration: async () => ({ success: true }),
+        releaseFreeGeneration: async (id: string) => {
+          releaseAttempts.push(id);
+          return { released: false, reason: 'db_error' };
+        },
+      },
+    });
+    const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
+    const { POST: POSTT34 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
+
+    globalThis.fetch = makeMockFetch(
+      'Research text without any verified data pack marker.',
+      buildLlmContractResponse({ team1: 40, draw: 27, team2: 33 }),
+      calls,
+    );
+
+    const res = await postAndApplyCookies(POSTT34, makeRequest({ match: 'Team A vs Team B' }));
+
+    assert.equal(res.status, 422, 'original HTTP response must be preserved on failed release');
+    const body = await res.json();
+    assert.ok(String(body.error).includes('VERIFIED DATA PACK'));
+    assert.ok(!JSON.stringify(body).includes('test-res-t34'), 'reservation id must not leak into the response');
+    assert.equal(releaseAttempts.length, 1, 'release must be attempted exactly once (no retry)');
+    assert.equal(releaseAttempts[0], 'test-res-t34');
   });
 });

@@ -1,6 +1,11 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
+import Link from 'next/link';
+import {
+  resolveAuthRequiredAudience,
+  AUTH_REQUIRED_MESSAGES,
+} from '@/lib/auth/auth-required';
 
 interface ProbabilityItem {
   label: string;
@@ -39,6 +44,39 @@ export default function Home() {
   const [loadingState, setLoadingState] = useState<'idle' | 'searching' | 'analyzing'>('idle');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [result, setResult] = useState<AnalysisResult | null>(null);
+  const [authRequired, setAuthRequired] = useState(false);
+  const [authEmail, setAuthEmail] = useState<string | null>(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [authBusy, setAuthBusy] = useState(false);
+
+  const refreshSession = async () => {
+    try {
+      const res = await fetch('/api/auth/me', { cache: 'no-store' });
+      const data = await res.json();
+      setAuthEmail(data?.user?.email ?? null);
+    } catch {
+      setAuthEmail(null);
+    } finally {
+      setAuthChecked(true);
+    }
+  };
+
+  useEffect(() => {
+    void refreshSession();
+  }, []);
+
+  const handleLogout = async () => {
+    setAuthBusy(true);
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' });
+      setAuthEmail(null);
+      setAuthRequired(false);
+    } catch {
+      // keep current state on network failure
+    } finally {
+      setAuthBusy(false);
+    }
+  };
 
   const handleAnalyze = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -49,6 +87,7 @@ export default function Home() {
 
     setResult(null);
     setErrorMsg(null);
+    setAuthRequired(false);
     
     // UX генерации по ТЗ:
     // 1. 🔎 Ищем актуальные данные...
@@ -71,6 +110,14 @@ export default function Home() {
       clearTimeout(searchTimer);
 
       const data = await response.json();
+
+      if (response.status === 402 && data.status === 'auth_required') {
+        await refreshSession();
+        setAuthRequired(true);
+        setErrorMsg(null);
+        setLoadingState('idle');
+        return;
+      }
 
       if (!response.ok || data.error) {
         setErrorMsg(data.error || 'Произошла ошибка при анализе матча.');
@@ -109,6 +156,33 @@ export default function Home() {
       <div className="w-full max-w-3xl flex flex-col items-center pt-8 sm:pt-16 pb-16">
         {/* Header */}
         <header className="text-center mb-10">
+          <div className="flex justify-end w-full mb-2">
+            {authChecked && authEmail ? (
+              <div className="flex items-center gap-3 text-xs text-slate-400">
+                <Link href="/dashboard" className="text-cyan-400 hover:text-cyan-300">
+                  Личный кабинет
+                </Link>
+                <span className="text-slate-300">{authEmail}</span>
+                <button
+                  type="button"
+                  onClick={handleLogout}
+                  disabled={authBusy}
+                  className="text-cyan-400 hover:text-cyan-300 disabled:opacity-50"
+                >
+                  Выйти
+                </button>
+              </div>
+            ) : authChecked ? (
+              <div className="flex items-center gap-3 text-xs">
+                <Link href="/auth/login" className="text-cyan-400 hover:text-cyan-300">
+                  Войти
+                </Link>
+                <Link href="/auth/signup" className="text-cyan-400 hover:text-cyan-300">
+                  Регистрация
+                </Link>
+              </div>
+            ) : null}
+          </div>
           <h1 className="text-4xl sm:text-6xl font-extrabold tracking-tight bg-gradient-to-r from-white via-slate-200 to-cyan-400 bg-clip-text text-transparent">
             ORAKUL AI
           </h1>
@@ -117,6 +191,44 @@ export default function Home() {
             AI-аналитик футбольных матчей на основе актуальных данных
           </p>
         </header>
+
+        {authRequired && (
+          <div className="w-full mb-6 rounded-xl border border-cyan-500/30 bg-cyan-500/5 px-5 py-4 text-center">
+            {resolveAuthRequiredAudience(authEmail) === 'authenticated' ? (
+              <div className="flex flex-col items-center gap-3">
+                <p className="text-sm text-slate-200">
+                  {AUTH_REQUIRED_MESSAGES.authenticated}
+                </p>
+                <Link
+                  href="/dashboard"
+                  className="px-5 py-2 rounded-lg border border-slate-700 text-slate-300 hover:border-cyan-500 hover:text-cyan-300 transition-colors text-sm"
+                >
+                  Личный кабинет
+                </Link>
+              </div>
+            ) : (
+              <>
+                <p className="text-sm text-slate-200 mb-3">
+                  {AUTH_REQUIRED_MESSAGES.anonymous}
+                </p>
+                <div className="flex items-center justify-center gap-4 text-sm">
+                  <Link
+                    href="/auth/signup"
+                    className="px-5 py-2 rounded-lg bg-cyan-500 text-white font-semibold hover:bg-cyan-400 transition-colors"
+                  >
+                    Зарегистрироваться
+                  </Link>
+                  <Link
+                    href="/auth/login"
+                    className="px-5 py-2 rounded-lg border border-slate-700 text-slate-300 hover:border-cyan-500 hover:text-cyan-300 transition-colors"
+                  >
+                    Войти
+                  </Link>
+                </div>
+              </>
+            )}
+          </div>
+        )}
 
         {/* Input Form */}
         <form onSubmit={handleAnalyze} className="w-full mb-8">

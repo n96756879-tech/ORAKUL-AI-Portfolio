@@ -16,6 +16,9 @@ import {
 } from './helpers/fixtures';
 import { clearResearchCacheForTests } from '../src/lib/data/research-cache';
 
+// We dynamically import POST after mocking in beforeEach
+let POST: any;
+
 type FetchCall = { url: string; method: string };
 
 function makeMockFetch(reportText: string, llmBody: string, calls: FetchCall[]) {
@@ -64,28 +67,29 @@ describe('A1: engine probabilities remain authoritative over LLM probabilities',
   const realErr = console.error;
   const realWarn = console.warn;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     clearResearchCacheForTests();
     calls = [];
     process.env.YDC_API_KEY = 'ydc_live_a1test';
     process.env.KEYDEALER_API_KEY = 'kd_live_a1test';
+    process.env.ANON_SESSION_SECRET = 'test-anon-session-secret-a1';
     console.log = () => {};
     console.error = () => {};
     console.warn = () => {};
-  });
-
-  afterEach(() => {
-    mock.restoreAll();
-    globalThis.fetch = realFetch;
-    delete process.env.YDC_API_KEY;
-    delete process.env.KEYDEALER_API_KEY;
-    console.log = realLog;
-    console.error = realErr;
-    console.warn = realWarn;
-  });
-
-  test('engine 38/17/45 + LLM 42/16/42 -> final 38/17/45', async () => {
-    // Engine — authoritative числа. Мок только на время этого теста.
+    // IMPORTANT: apply probability-engine mock BEFORE importing route (so the authoritative override is seen by production code).
+    // Then mock next/headers + free-limit, then dynamically import route.
+    mock.module('next/headers', {
+      namedExports: {
+        cookies: async () => ({
+          get: async (name: string) => ({ name, value: 'a1-test-sid' }),
+          set: async () => {},
+          has: async () => true,
+          delete: async () => {},
+          getAll: async () => [{ name: 'anon_sid', value: 'a1-test-sid' }],
+          keys: async () => ['anon_sid'],
+        }),
+      },
+    });
     mock.module('@/lib/probability-engine', {
       namedExports: {
         calculateProbabilities: () => ({ team1: 38, draw: 17, team2: 45 }),
@@ -95,9 +99,33 @@ describe('A1: engine probabilities remain authoritative over LLM probabilities',
         }),
       },
     });
+    // Mock free generation ledger (success path) BEFORE route import
+    mock.module('@/lib/supabase/free-limit', {
+      namedExports: {
+        reserveFreeGeneration: async () => ({ allowed: true, reservationId: 'test-res-a1' }),
+        consumeFreeGeneration: async () => ({ success: true }),
+        releaseFreeGeneration: async () => ({ released: true, deletedCount: 1 as const }),
+      },
+    });
+    // Dynamically import AFTER the mocks are in place — this ensures production route.ts loads the mocks
+    const mod = await import('../src/app/api/analyze/route');
+    POST = mod.POST;
+  });
 
-    const { POST } = await import('../src/app/api/analyze/route');
+  afterEach(() => {
+    mock.restoreAll();
+    globalThis.fetch = realFetch;
+    delete process.env.YDC_API_KEY;
+    delete process.env.KEYDEALER_API_KEY;
+    delete process.env.ANON_SESSION_SECRET;
+    console.log = realLog;
+    console.error = realErr;
+    console.warn = realWarn;
+  });
 
+  test('engine 38/17/45 + LLM 42/16/42 -> final 38/17/45', async () => {
+    // Engine — authoritative числа. Мок применяется в beforeEach до импорта route.
+    // LLM намеренно возвращает ДРУГИЕ числа (42/16/42), сумма 100 — контракт валиден.
     const report = buildResearchReportWithVdp(buildFullVdp());
     // LLM намеренно возвращает ДРУГИЕ числа (42/16/42), сумма 100 — контракт валиден.
     const llmBody = buildLlmContractResponse({ team1: 42, draw: 16, team2: 42 });

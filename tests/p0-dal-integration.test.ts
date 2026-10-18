@@ -1,9 +1,10 @@
 // STEP 9: regression-тесты интеграции DAL за feature flag ORAKUL_DAL_ENABLED.
 // Сеть полностью замокана (globalThis.fetch): You.com init+poll, KeyDealer chat.
 // Реальные API, .env и ключи не используются. DAL работает без fetchers (только cache).
+// NOTE: we do NOT import { POST } statically — we dynamically import it AFTER mock.module in beforeEach to ensure the mock intercepts the free-limit import inside route.ts.
 import { test, describe, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { POST } from '../src/app/api/analyze/route';
+import { mock } from 'node:test';
 import { buildMatchCacheKey, getSharedDataPackCache, matchQueryFromFreeForm } from '../src/lib/data/resolver';
 import type { DataPack, ProvenancedEntry } from '../src/lib/data/types';
 import { clearResearchCacheForTests } from '../src/lib/data/research-cache';
@@ -12,6 +13,9 @@ import {
   buildResearchReportWithVdp,
   buildLlmContractResponse,
 } from './helpers/fixtures';
+
+// Dynamically assigned after beforeEach mock + import
+let POST: any;
 
 type FetchCall = { url: string; method: string };
 
@@ -90,25 +94,52 @@ describe('STEP 9: DAL integration behind ORAKUL_DAL_ENABLED', () => {
   const realErr = console.error;
   const realWarn = console.warn;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     calls = [];
     clearResearchCacheForTests();
     process.env.YDC_API_KEY = 'ydc_live_p0test';
     process.env.KEYDEALER_API_KEY = 'kd_live_p0test';
+    process.env.ANON_SESSION_SECRET = 'test-anon-session-secret-dal';
     console.log = () => {};
     console.error = () => {};
     console.warn = () => {};
+    // IMPORTANT: mock BEFORE dynamic import of the route module so that route.ts sees the mocked free-limit and next/headers mocks
+    // Use namedExports to satisfy current @types/node; runtime will show deprecation but still mock correctly.
+    mock.module('next/headers', {
+      namedExports: {
+        cookies: async () => ({
+          get: async (name: string) => ({ name, value: 'dal-test-sid' }),
+          set: async () => {},
+          has: async () => true,
+          delete: async () => {},
+          getAll: async () => [{ name: 'anon_sid', value: 'dal-test-sid' }],
+          keys: async () => ['anon_sid'],
+        }),
+      },
+    });
+    mock.module('@/lib/supabase/free-limit', {
+      namedExports: {
+        reserveFreeGeneration: async () => ({ allowed: true, reservationId: 'test-res-dal' }),
+        consumeFreeGeneration: async () => ({ success: true }),
+        releaseFreeGeneration: async () => ({ released: true, deletedCount: 1 as const }),
+      },
+    });
+    // Dynamically import AFTER the mock is in place — this ensures production route.ts loads the mock
+    const mod = await import('../src/app/api/analyze/route');
+    POST = mod.POST;
   });
 
   afterEach(() => {
     globalThis.fetch = realFetch;
     delete process.env.YDC_API_KEY;
     delete process.env.KEYDEALER_API_KEY;
+    delete process.env.ANON_SESSION_SECRET;
     delete process.env.ORAKUL_DAL_ENABLED;
     getSharedDataPackCache().clear();
     console.log = realLog;
     console.error = realErr;
     console.warn = realWarn;
+    mock.restoreAll();
   });
 
   test('S1: флаг отсутствует → DAL bypass, pipeline как раньше', async () => {
