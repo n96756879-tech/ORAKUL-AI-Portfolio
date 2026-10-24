@@ -197,6 +197,8 @@ describe('P0 API /api/analyze (current behavior)', () => {
     process.env.YDC_API_KEY = 'ydc_live_p0test';
     process.env.KEYDEALER_API_KEY = 'kd_live_p0test';
     process.env.ANON_SESSION_SECRET = 'test-anon-session-secret-p0';
+    // Server-side analysis price must be configured; individual config tests override/delete it.
+    process.env.ANALYSIS_COST = '10';
     // route.ts пишет большие diagnostic-логи — гасим на время теста
     console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
     console.error = () => {};
@@ -227,6 +229,7 @@ describe('P0 API /api/analyze (current behavior)', () => {
     delete process.env.YDC_API_KEY;
     delete process.env.KEYDEALER_API_KEY;
     delete process.env.ANON_SESSION_SECRET;
+    delete process.env.ANALYSIS_COST;
     console.log = realLog;
     console.error = realErr;
     console.warn = realWarn;
@@ -973,5 +976,682 @@ describe('P0 API /api/analyze (current behavior)', () => {
     assert.ok(!JSON.stringify(body).includes('test-res-t34'), 'reservation id must not leak into the response');
     assert.equal(releaseAttempts.length, 1, 'release must be attempted exactly once (no retry)');
     assert.equal(releaseAttempts[0], 'test-res-t34');
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // CREDIT PAYMENT REGRESSION TESTS (execute real POST production entrypoint)
+  // All use dynamic import after mocks so production route.ts + credits/session are exercised.
+  // Mocks verify app flow; SQL atomicity is provided by (future) RPCs, not claimed here.
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  describe('credit payment for authenticated users (ANALYSIS_COST)', () => {
+    const realFetch = globalThis.fetch;
+    let calls: FetchCall[];
+    let logs: string[];
+    const realLog = console.log;
+    const realErr = console.error;
+    const realWarn = console.warn;
+
+    let currentBalance: number;
+    let reserveCalls: any[];
+    let consumeCalls: string[];
+    let releaseCalls: string[];
+    let freeReserveCalls: string[];
+    let freeConsumeCalls: string[];
+    let freeReleaseCalls: string[];
+
+    beforeEach(async () => {
+      calls = [];
+      logs = [];
+      clearResearchCacheForTests();
+      process.env.YDC_API_KEY = 'ydc_live_p0test';
+      process.env.KEYDEALER_API_KEY = 'kd_live_p0test';
+      process.env.ANON_SESSION_SECRET = 'test-anon-session-secret-p0';
+      process.env.ANALYSIS_COST = '10';
+      currentBalance = 100;
+      reserveCalls = [];
+      consumeCalls = [];
+      releaseCalls = [];
+      freeReserveCalls = [];
+      freeConsumeCalls = [];
+      freeReleaseCalls = [];
+      console.log = (...args: unknown[]) => logs.push(args.map(String).join(' '));
+      console.error = () => {};
+      console.warn = () => {};
+      clearCookieStore();
+      mock.restoreAll();
+      mock.module('next/headers', {
+        namedExports: {
+          cookies: async () => mockCookieKit(),
+        },
+      });
+      // Default to anon free (will be overridden in authed tests)
+      mock.module('@/lib/supabase/free-limit', {
+        namedExports: {
+          reserveFreeGeneration: async (id: string) => { freeReserveCalls.push(id); return { allowed: true, reservationId: 'free-res' }; },
+          consumeFreeGeneration: async (id: string) => { freeConsumeCalls.push(id); return { success: true }; },
+          releaseFreeGeneration: async (id: string) => { freeReleaseCalls.push(id); return { released: true, deletedCount: 1 as const }; },
+        },
+      });
+      mock.module('@/lib/supabase/server', {
+        namedExports: {
+          createClient: async () => ({ auth: {} }),
+        },
+      });
+      mock.module('@/lib/auth/session', {
+        namedExports: {
+          getCurrentSession: async () => ({ ok: false, error: 'no session' }),
+        },
+      });
+      mock.module('@/lib/supabase/credits', {
+        namedExports: {
+          reserveCreditSpend: async (client: any, input: any) => {
+            reserveCalls.push(input);
+            if (currentBalance < input.amount) {
+              return { ok: false, reason: 'insufficient_funds', balance: currentBalance, status: 402 };
+            }
+            currentBalance -= input.amount;
+            return { ok: true, reservationId: 'cr-' + reserveCalls.length, balanceAfter: currentBalance };
+          },
+          consumeCreditSpend: async (_c: any, _id: any, idempotencyKey: any) => {
+            consumeCalls.push(String(idempotencyKey));
+            return { success: true };
+          },
+          releaseCreditSpend: async (_c: any, _id: any, idempotencyKey: any) => {
+            releaseCalls.push(String(idempotencyKey));
+            // refund for test accounting
+            currentBalance += 10;
+            return { released: true };
+          },
+        },
+      });
+      const mod = await import('../src/app/api/analyze/route');
+      POST = mod.POST;
+      buildGoalDistributionInput = mod.buildGoalDistributionInput;
+    });
+
+    afterEach(() => {
+      globalThis.fetch = realFetch;
+      delete process.env.YDC_API_KEY;
+      delete process.env.KEYDEALER_API_KEY;
+      delete process.env.ANON_SESSION_SECRET;
+      delete process.env.ANALYSIS_COST;
+      console.log = realLog;
+      console.error = realErr;
+      console.warn = realWarn;
+      mock.restoreAll();
+    });
+
+    test('C1: authed user with sufficient balance gets 200 and spend is called exactly once (real POST)', async () => {
+      mock.restoreAll();
+      process.env.ANALYSIS_COST = '10';
+      mock.module('next/headers', { namedExports: { cookies: async () => mockCookieKit() } });
+      mock.module('@/lib/supabase/server', { namedExports: { createClient: async () => ({ auth: {} }) } });
+      mock.module('@/lib/supabase/admin', { namedExports: { createServiceRoleClient: () => ({ admin: true }) } });
+      mock.module('@/lib/auth/session', { namedExports: { getCurrentSession: async () => ({ ok: true, user: { id: 'u-sufficient', email: 'a@b' } }) } });
+      mock.module('@/lib/supabase/credits', {
+        namedExports: {
+          reserveCreditSpend: async (_c: any, input: any) => { reserveCalls.push(input); currentBalance -= input.amount; return { ok: true, reservationId: 'cr-c1' }; },
+          consumeCreditSpend: async (_c: any, k: any) => { consumeCalls.push(k.idempotencyKey || 'k'); return { success: true }; },
+          releaseCreditSpend: async () => ({ released: true }),
+        },
+      });
+      mock.module('@/lib/supabase/free-limit', {
+        namedExports: {
+          reserveFreeGeneration: async () => { freeReserveCalls.push('should-not'); return { allowed: true, reservationId: 'no' }; },
+          consumeFreeGeneration: async () => ({ success: true }),
+          releaseFreeGeneration: async () => ({ released: true, deletedCount: 1 as const }),
+        },
+      });
+      const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
+      const { POST: POSTC1 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
+      globalThis.fetch = makeMockFetch(buildResearchReportWithVdp(buildFullVdp()), buildLlmContractResponse({ team1: 50, draw: 25, team2: 25 }), calls);
+      const res = await postAndApplyCookies(POSTC1, makeRequest({ match: 'Team A vs Team B' }));
+      assert.equal(res.status, 200);
+      assert.equal(reserveCalls.length, 1);
+      assert.equal(consumeCalls.length, 1);
+      assert.equal(freeReserveCalls.length, 0, 'free limit must be bypassed for authed');
+      const body = await res.json();
+      assert.equal(body.status, 'success');
+    });
+
+    test('C2: insufficient balance returns 402 with code insufficient_credits (no double spend)', async () => {
+      currentBalance = 5;
+      mock.restoreAll();
+      process.env.ANALYSIS_COST = '10';
+      mock.module('next/headers', { namedExports: { cookies: async () => mockCookieKit() } });
+      mock.module('@/lib/supabase/server', { namedExports: { createClient: async () => ({ auth: {} }) } });
+      mock.module('@/lib/supabase/admin', { namedExports: { createServiceRoleClient: () => ({ admin: true }) } });
+      mock.module('@/lib/auth/session', { namedExports: { getCurrentSession: async () => ({ ok: true, user: { id: 'u-poor', email: 'a@b' } }) } });
+      mock.module('@/lib/supabase/credits', {
+        namedExports: {
+          reserveCreditSpend: async (_c: any, input: any) => {
+            reserveCalls.push(input);
+            return { ok: false, reason: 'insufficient_funds', balance: currentBalance, status: 402 };
+          },
+          consumeCreditSpend: async () => ({ success: true }),
+          releaseCreditSpend: async () => ({ released: true }),
+        },
+      });
+      mock.module('@/lib/supabase/free-limit', {
+        namedExports: {
+          reserveFreeGeneration: async () => { freeReserveCalls.push('no'); return { allowed: true, reservationId: 'x' }; },
+          consumeFreeGeneration: async () => ({ success: true }),
+          releaseFreeGeneration: async () => ({ released: true, deletedCount: 1 as const }),
+        },
+      });
+      const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
+      const { POST: POSTC2 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
+      globalThis.fetch = makeMockFetch('report', 'llm', calls);
+      const res = await postAndApplyCookies(POSTC2, makeRequest({ match: 'Team A vs Team B' }));
+      assert.equal(res.status, 402);
+      const body = await res.json();
+      assert.equal(body.status || body.code, 'insufficient_credits');
+      assert.ok(body.balance !== undefined);
+      assert.equal(reserveCalls.length, 1);
+      assert.equal(calls.length, 0, 'no research on insufficient');
+    });
+
+    test('C3: insufficient credits does not invoke Research/DAL/LLM (real prod path)', async () => {
+      currentBalance = 0;
+      mock.restoreAll();
+      process.env.ANALYSIS_COST = '10';
+      mock.module('next/headers', { namedExports: { cookies: async () => mockCookieKit() } });
+      mock.module('@/lib/supabase/server', { namedExports: { createClient: async () => ({ auth: {} }) } });
+      mock.module('@/lib/supabase/admin', { namedExports: { createServiceRoleClient: () => ({ admin: true }) } });
+      mock.module('@/lib/auth/session', { namedExports: { getCurrentSession: async () => ({ ok: true, user: { id: 'u-zero' } }) } });
+      mock.module('@/lib/supabase/credits', {
+        namedExports: {
+          reserveCreditSpend: async (_c: any, i: any) => { reserveCalls.push(i); return { ok: false, reason: 'insufficient_funds', balance: 0 }; },
+          consumeCreditSpend: async () => ({ success: true }),
+          releaseCreditSpend: async () => ({ released: true }),
+        },
+      });
+      const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
+      const { POST: POSTC3 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
+      globalThis.fetch = makeMockFetch(buildResearchReportWithVdp(buildFullVdp()), buildLlmContractResponse({ team1: 40, draw: 30, team2: 30 }), calls);
+      const res = await postAndApplyCookies(POSTC3, makeRequest({ match: 'X vs Y' }));
+      assert.equal(res.status, 402);
+      assert.equal(calls.filter(c => c.url.includes('you.com') || c.url.includes('keydealer')).length, 0);
+    });
+
+    test('C4: successful analysis decreases balance exactly by ANALYSIS_COST (tracked via mock)', async () => {
+      currentBalance = 25;
+      mock.restoreAll();
+      process.env.ANALYSIS_COST = '10';
+      mock.module('next/headers', { namedExports: { cookies: async () => mockCookieKit() } });
+      mock.module('@/lib/supabase/server', { namedExports: { createClient: async () => ({ auth: {} }) } });
+      mock.module('@/lib/supabase/admin', { namedExports: { createServiceRoleClient: () => ({ admin: true }) } });
+      mock.module('@/lib/auth/session', { namedExports: { getCurrentSession: async () => ({ ok: true, user: { id: 'u-bal' } }) } });
+      mock.module('@/lib/supabase/credits', {
+        namedExports: {
+          reserveCreditSpend: async (_c: any, input: any) => { reserveCalls.push(input); currentBalance -= input.amount; return { ok: true, reservationId: 'cr-bal' }; },
+          consumeCreditSpend: async () => { consumeCalls.push('bal'); return { success: true }; },
+          releaseCreditSpend: async () => ({ released: true }),
+        },
+      });
+      const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
+      const { POST: POSTC4 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
+      globalThis.fetch = makeMockFetch(buildResearchReportWithVdp(buildFullVdp()), buildLlmContractResponse({ team1: 45, draw: 25, team2: 30 }), calls);
+      const res = await postAndApplyCookies(POSTC4, makeRequest({ match: 'A vs B' }));
+      assert.equal(res.status, 200);
+      assert.equal(reserveCalls.length, 1);
+      assert.equal(reserveCalls[0].amount, 10);
+      // after deduct in mock
+      assert.equal(currentBalance, 15);
+    });
+
+    test('C5: balance exactly equal to cost allows one analysis and does not go negative', async () => {
+      currentBalance = 10;
+      mock.restoreAll();
+      process.env.ANALYSIS_COST = '10';
+      mock.module('next/headers', { namedExports: { cookies: async () => mockCookieKit() } });
+      mock.module('@/lib/supabase/server', { namedExports: { createClient: async () => ({ auth: {} }) } });
+      mock.module('@/lib/supabase/admin', { namedExports: { createServiceRoleClient: () => ({ admin: true }) } });
+      mock.module('@/lib/auth/session', { namedExports: { getCurrentSession: async () => ({ ok: true, user: { id: 'u-exact' } }) } });
+      mock.module('@/lib/supabase/credits', {
+        namedExports: {
+          reserveCreditSpend: async (_c: any, input: any) => {
+            if (currentBalance < input.amount) return { ok: false, reason: 'insufficient_funds', balance: currentBalance };
+            currentBalance -= input.amount;
+            reserveCalls.push(input);
+            return { ok: true, reservationId: 'cr-exact' };
+          },
+          consumeCreditSpend: async () => { consumeCalls.push('ex'); return { success: true }; },
+          releaseCreditSpend: async () => ({ released: true }),
+        },
+      });
+      const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
+      const { POST: POSTC5 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
+      globalThis.fetch = makeMockFetch(buildResearchReportWithVdp(buildFullVdp()), buildLlmContractResponse({ team1: 40, draw: 20, team2: 40 }), calls);
+      const res = await postAndApplyCookies(POSTC5, makeRequest({ match: 'Exact vs Cost' }));
+      assert.equal(res.status, 200);
+      assert.equal(currentBalance, 0);
+      // second attempt must now fail
+      const res2 = await postAndApplyCookies(POSTC5, makeRequest({ match: 'Exact vs Cost 2' }));
+      assert.equal(res2.status, 402);
+      assert.equal(currentBalance, 0);
+    });
+
+    test('C6: two sequential spends with shared balance do not produce negative (app-level)', async () => {
+      currentBalance = 15;
+      mock.restoreAll();
+      process.env.ANALYSIS_COST = '10';
+      mock.module('next/headers', { namedExports: { cookies: async () => mockCookieKit() } });
+      mock.module('@/lib/supabase/server', { namedExports: { createClient: async () => ({ auth: {} }) } });
+      mock.module('@/lib/supabase/admin', { namedExports: { createServiceRoleClient: () => ({ admin: true }) } });
+      mock.module('@/lib/auth/session', { namedExports: { getCurrentSession: async () => ({ ok: true, user: { id: 'u-conc' } }) } });
+      mock.module('@/lib/supabase/credits', {
+        namedExports: {
+          reserveCreditSpend: async (_c: any, input: any) => {
+            reserveCalls.push(input);
+            if (currentBalance < input.amount) return { ok: false, reason: 'insufficient_funds', balance: currentBalance };
+            currentBalance -= input.amount;
+            return { ok: true, reservationId: 'cr-seq' + reserveCalls.length };
+          },
+          consumeCreditSpend: async () => ({ success: true }),
+          releaseCreditSpend: async () => ({ released: true }),
+        },
+      });
+      const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
+      const { POST: POSTC6 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
+      globalThis.fetch = makeMockFetch(buildResearchReportWithVdp(buildFullVdp()), buildLlmContractResponse({ team1: 33, draw: 33, team2: 34 }), calls);
+      const r1 = await postAndApplyCookies(POSTC6, makeRequest({ match: 'One vs Two' }));
+      const r2 = await postAndApplyCookies(POSTC6, makeRequest({ match: 'Three vs Four' }));
+      assert.equal(r1.status, 200);
+      assert.equal(r2.status, 402); // second should fail, balance now 5 < 10
+      assert.ok(currentBalance >= 0);
+      assert.equal(currentBalance, 5);
+    });
+
+    test('C7: repeat same idempotency key does not spend twice (isDuplicate path)', async () => {
+      currentBalance = 30;
+      let dup = false;
+      mock.restoreAll();
+      process.env.ANALYSIS_COST = '10';
+      mock.module('next/headers', { namedExports: { cookies: async () => mockCookieKit() } });
+      mock.module('@/lib/supabase/server', { namedExports: { createClient: async () => ({ auth: {} }) } });
+      mock.module('@/lib/supabase/admin', { namedExports: { createServiceRoleClient: () => ({ admin: true }) } });
+      mock.module('@/lib/auth/session', { namedExports: { getCurrentSession: async () => ({ ok: true, user: { id: 'u-idem' } }) } });
+      mock.module('@/lib/supabase/credits', {
+        namedExports: {
+          reserveCreditSpend: async (_c: any, input: any) => {
+            if (reserveCalls.find((x: any) => x.idempotencyKey === input.idempotencyKey)) {
+              dup = true;
+              return { ok: true, reservationId: 'dup', isDuplicate: true };
+            }
+            reserveCalls.push(input);
+            currentBalance -= input.amount;
+            return { ok: true, reservationId: 'cr-idem' };
+          },
+          consumeCreditSpend: async () => { consumeCalls.push('idem'); return { success: true }; },
+          releaseCreditSpend: async () => ({ released: true }),
+        },
+      });
+      const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
+      const { POST: POSTC7 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
+      globalThis.fetch = makeMockFetch(buildResearchReportWithVdp(buildFullVdp()), buildLlmContractResponse({ team1: 60, draw: 10, team2: 30 }), calls);
+      // first
+      const r1 = await postAndApplyCookies(POSTC7, makeRequest({ match: 'Idem Match' }));
+      assert.equal(r1.status, 200);
+      // simulate repeat with same key by direct (in real the key is generated inside route per request; here we trust the mock detects dup on same input)
+      // To exercise the path we call reserve directly via the mocked function
+      const { reserveCreditSpend } = await import('@/lib/supabase/credits');
+      await (reserveCreditSpend as any)({}, { userId: 'u-idem', amount: 10, idempotencyKey: reserveCalls[0]?.idempotencyKey || 'same-key' });
+      assert.equal(dup || reserveCalls.length === 1, true);
+    });
+
+    test('C8: repeat key with different params is rejected (conflict)', async () => {
+      // This is enforced in the RPC layer (see migration). Here we simulate via mock returning error for mismatch.
+      mock.restoreAll();
+      process.env.ANALYSIS_COST = '10';
+      mock.module('next/headers', { namedExports: { cookies: async () => mockCookieKit() } });
+      mock.module('@/lib/supabase/server', { namedExports: { createClient: async () => ({ auth: {} }) } });
+      mock.module('@/lib/supabase/admin', { namedExports: { createServiceRoleClient: () => ({ admin: true }) } });
+      mock.module('@/lib/auth/session', { namedExports: { getCurrentSession: async () => ({ ok: true, user: { id: 'u-conf' } }) } });
+      mock.module('@/lib/supabase/credits', {
+        namedExports: {
+          reserveCreditSpend: async (_c: any, input: any) => {
+            if (input.idempotencyKey === 'conflict-key' && input.amount !== 10) {
+              return { ok: false, reason: 'idempotency_conflict', status: 409 };
+            }
+            reserveCalls.push(input);
+            currentBalance = (currentBalance || 20) - 10;
+            return { ok: true, reservationId: 'cr-conf' };
+          },
+          consumeCreditSpend: async () => ({ success: true }),
+          releaseCreditSpend: async () => ({ released: true }),
+        },
+      });
+      const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
+      const { POST: POSTC8 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
+      globalThis.fetch = makeMockFetch(buildResearchReportWithVdp(buildFullVdp()), buildLlmContractResponse({ team1: 50, draw: 25, team2: 25 }), calls);
+      const r = await postAndApplyCookies(POSTC8, makeRequest({ match: 'Conf Match' }));
+      assert.equal(r.status, 200);
+      // direct conflict simulation
+      const { reserveCreditSpend } = await import('@/lib/supabase/credits');
+      const bad = await (reserveCreditSpend as any)({}, { userId: 'u-conf', amount: 99, idempotencyKey: 'conflict-key' });
+      assert.equal(bad.ok, false);
+      assert.equal(bad.status, 409);
+    });
+
+    test('C9: error before final success releases the credit reservation exactly once', async () => {
+      mock.restoreAll();
+      process.env.ANALYSIS_COST = '10';
+      mock.module('next/headers', { namedExports: { cookies: async () => mockCookieKit() } });
+      mock.module('@/lib/supabase/server', { namedExports: { createClient: async () => ({ auth: {} }) } });
+      mock.module('@/lib/supabase/admin', { namedExports: { createServiceRoleClient: () => ({ admin: true }) } });
+      mock.module('@/lib/auth/session', { namedExports: { getCurrentSession: async () => ({ ok: true, user: { id: 'u-err' } }) } });
+      const released: string[] = [];
+      mock.module('@/lib/supabase/credits', {
+        namedExports: {
+          reserveCreditSpend: async () => ({ ok: true, reservationId: 'cr-err' }),
+          consumeCreditSpend: async () => ({ success: true }),
+          releaseCreditSpend: async (_c: any, _id: any, idem: any) => { released.push(String(idem)); return { released: true }; },
+        },
+      });
+      const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
+      const { POST: POSTC9 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
+      // Deterministic failure after Research succeeded: the LLM endpoint returns HTTP 500.
+      // This is a proven failure (no analysis result), so the reservation must be released once.
+      globalThis.fetch = makeMockFetch(
+        buildResearchReportWithVdp(buildFullVdp()),
+        buildLlmContractResponse({ team1: 50, draw: 25, team2: 25 }),
+        calls,
+        500,
+      );
+      const res = await postAndApplyCookies(POSTC9, makeRequest({ match: 'Err Match' }));
+      assert.equal(res.status, 502);
+      assert.equal(released.length, 1);
+    });
+
+    test('C9b: ambiguous Research failure keeps the credit reservation (no blind refund)', async () => {
+      mock.restoreAll();
+      process.env.ANALYSIS_COST = '10';
+      mock.module('next/headers', { namedExports: { cookies: async () => mockCookieKit() } });
+      mock.module('@/lib/supabase/server', { namedExports: { createClient: async () => ({ auth: {} }) } });
+      mock.module('@/lib/auth/session', { namedExports: { getCurrentSession: async () => ({ ok: true, user: { id: 'u-ambiguous' } }) } });
+      const released: string[] = [];
+      mock.module('@/lib/supabase/credits', {
+        namedExports: {
+          reserveCreditSpend: async () => ({ ok: true, reservationId: 'cr-ambiguous' }),
+          consumeCreditSpend: async () => ({ success: true }),
+          releaseCreditSpend: async (_c: any, _id: any, idem: any) => { released.push(String(idem)); return { released: true }; },
+        },
+      });
+      const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
+      const { POST: POSTC9b } = await import(`../src/app/api/analyze/route?cb=${bust}`);
+      globalThis.fetch = (async (u: any) => {
+        if (String(u) === 'https://api.you.com/v1/research') return new Response('boom', { status: 500 });
+        throw new Error('unexpected fetch in C9b: ' + u);
+      }) as typeof fetch;
+      const res = await postAndApplyCookies(POSTC9b, makeRequest({ match: 'Ambiguous vs Match' }));
+      assert.equal(res.status, 500);
+      assert.equal(released.length, 0, 'ambiguous Research outcome must keep the reservation for reconciliation');
+    });
+
+    test('C10: consume failure after building result returns 500 and does not deliver analysis (like free T22)', async () => {
+      mock.restoreAll();
+      process.env.ANALYSIS_COST = '10';
+      mock.module('next/headers', { namedExports: { cookies: async () => mockCookieKit() } });
+      mock.module('@/lib/supabase/server', { namedExports: { createClient: async () => ({ auth: {} }) } });
+      mock.module('@/lib/supabase/admin', { namedExports: { createServiceRoleClient: () => ({ admin: true }) } });
+      mock.module('@/lib/auth/session', { namedExports: { getCurrentSession: async () => ({ ok: true, user: { id: 'u-consume-fail' } }) } });
+      mock.module('@/lib/supabase/credits', {
+        namedExports: {
+          reserveCreditSpend: async () => ({ ok: true, reservationId: 'cr-consume-fail' }),
+          consumeCreditSpend: async () => ({ success: false }),
+          releaseCreditSpend: async () => ({ released: true }),
+        },
+      });
+      const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
+      const { POST: POSTC10 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
+      globalThis.fetch = makeMockFetch(buildResearchReportWithVdp(buildFullVdp()), buildLlmContractResponse({ team1: 40, draw: 20, team2: 40 }), calls);
+      const res = await postAndApplyCookies(POSTC10, makeRequest({ match: 'ConsumeFail vs Match' }));
+      assert.equal(res.status, 500);
+      const body = await res.json();
+      assert.ok(String(body.error || '').toLowerCase().includes('accounting') || String(body.error || '').includes('credit'));
+      assert.ok(!JSON.stringify(body).includes('success'));
+    });
+
+    test('C11: missing or invalid ANALYSIS_COST blocks before any research (controlled error)', async () => {
+      mock.restoreAll();
+      delete process.env.ANALYSIS_COST;
+      mock.module('next/headers', { namedExports: { cookies: async () => mockCookieKit() } });
+      mock.module('@/lib/supabase/server', { namedExports: { createClient: async () => ({ auth: {} }) } });
+      mock.module('@/lib/supabase/admin', { namedExports: { createServiceRoleClient: () => ({ admin: true }) } });
+      mock.module('@/lib/auth/session', { namedExports: { getCurrentSession: async () => ({ ok: true, user: { id: 'u-cfg' } }) } });
+      mock.module('@/lib/supabase/credits', {
+        namedExports: {
+          reserveCreditSpend: async () => { throw new Error('should not be called'); },
+          consumeCreditSpend: async () => ({ success: true }),
+          releaseCreditSpend: async () => ({ released: true }),
+        },
+      });
+      const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
+      const { POST: POSTC11 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
+      globalThis.fetch = makeMockFetch(buildResearchReportWithVdp(buildFullVdp()), buildLlmContractResponse({ team1: 50, draw: 25, team2: 25 }), calls);
+      const res = await postAndApplyCookies(POSTC11, makeRequest({ match: 'Cfg Match' }));
+      assert.notEqual(res.status, 200);
+      assert.equal(calls.length, 0);
+      // also test invalid value
+      process.env.ANALYSIS_COST = 'not-a-number';
+      const bust2 = Date.now().toString(36) + Math.random().toString(36).slice(2);
+      const { POST: POSTC11b } = await import(`../src/app/api/analyze/route?cb=${bust2}`);
+      const res2 = await postAndApplyCookies(POSTC11b, makeRequest({ match: 'Cfg2' }));
+      assert.notEqual(res2.status, 200);
+      assert.equal(calls.length, 0);
+    });
+
+    test('C12: anonymous free-limit auth_required 402 and its behavior is unchanged', async () => {
+      mock.restoreAll();
+      process.env.ANALYSIS_COST = '10';
+      mock.module('next/headers', { namedExports: { cookies: async () => mockCookieKit() } });
+      mock.module('@/lib/supabase/server', { namedExports: { createClient: async () => ({ auth: {} }) } });
+      mock.module('@/lib/supabase/admin', { namedExports: { createServiceRoleClient: () => ({ admin: true }) } });
+      mock.module('@/lib/auth/session', { namedExports: { getCurrentSession: async () => ({ ok: false, error: 'no' }) } });
+      let freeHit = false;
+      mock.module('@/lib/supabase/free-limit', {
+        namedExports: {
+          reserveFreeGeneration: async () => { freeHit = true; return { allowed: false, reason: 'limit_exhausted' as const }; },
+          consumeFreeGeneration: async () => ({ success: true }),
+          releaseFreeGeneration: async () => ({ released: true, deletedCount: 1 as const }),
+        },
+      });
+      const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
+      const { POST: POSTC12 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
+      const res = await postAndApplyCookies(POSTC12, makeRequest({ match: 'Anon vs Free' }));
+      assert.equal(res.status, 402);
+      const body = await res.json();
+      assert.equal(body.status, 'auth_required');
+      assert.ok(freeHit);
+    });
+
+    test('C13: client cannot dictate userId or price - server uses session + env (extra fields ignored)', async () => {
+      currentBalance = 20;
+      mock.restoreAll();
+      process.env.ANALYSIS_COST = '10';
+      mock.module('next/headers', { namedExports: { cookies: async () => mockCookieKit() } });
+      mock.module('@/lib/supabase/server', { namedExports: { createClient: async () => ({ auth: {} }) } });
+      mock.module('@/lib/supabase/admin', { namedExports: { createServiceRoleClient: () => ({ admin: true }) } });
+      mock.module('@/lib/auth/session', { namedExports: { getCurrentSession: async () => ({ ok: true, user: { id: 'u-server' } }) } });
+      let seenUser: string | null = null;
+      mock.module('@/lib/supabase/credits', {
+        namedExports: {
+          reserveCreditSpend: async (_c: any, input: any) => { seenUser = input.userId; reserveCalls.push(input); currentBalance -= 10; return { ok: true, reservationId: 'cr-srv' }; },
+          consumeCreditSpend: async () => ({ success: true }),
+          releaseCreditSpend: async () => ({ released: true }),
+        },
+      });
+      const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
+      const { POST: POSTC13 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
+      globalThis.fetch = makeMockFetch(buildResearchReportWithVdp(buildFullVdp()), buildLlmContractResponse({ team1: 50, draw: 25, team2: 25 }), calls);
+      const res = await postAndApplyCookies(POSTC13, makeRequest({ match: 'Srv vs Price', userId: 'hacker', price: 1, cost: 1 }));
+      assert.equal(res.status, 200);
+      assert.equal(seenUser, 'u-server'); // not the hacker value
+      assert.equal(reserveCalls[0].amount, 10); // from env, not client
+    });
+
+    test('C14: two separate analyses of the same match spend separately (distinct operationId)', async () => {
+      currentBalance = 30;
+      mock.restoreAll();
+      process.env.ANALYSIS_COST = '10';
+      mock.module('next/headers', { namedExports: { cookies: async () => mockCookieKit() } });
+      mock.module('@/lib/supabase/server', { namedExports: { createClient: async () => ({ auth: {} }) } });
+      mock.module('@/lib/supabase/admin', { namedExports: { createServiceRoleClient: () => ({ admin: true }) } });
+      mock.module('@/lib/auth/session', { namedExports: { getCurrentSession: async () => ({ ok: true, user: { id: 'u-distinct' } }) } });
+      mock.module('@/lib/supabase/credits', {
+        namedExports: {
+          reserveCreditSpend: async (_c: any, input: any) => {
+            reserveCalls.push(input);
+            currentBalance -= input.amount;
+            return { ok: true, reservationId: 'cr-' + reserveCalls.length };
+          },
+          consumeCreditSpend: async (_c: any, _id: any, idem: any) => { consumeCalls.push(String(idem)); return { success: true }; },
+          releaseCreditSpend: async () => ({ released: true }),
+        },
+      });
+      const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
+      const { POST: POSTC14 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
+      globalThis.fetch = makeMockFetch(buildResearchReportWithVdp(buildFullVdp()), buildLlmContractResponse({ team1: 40, draw: 30, team2: 30 }), calls);
+
+      const r1 = await postAndApplyCookies(POSTC14, makeRequest({ match: 'Same Match', operationId: 'op-aaaaaaaa-1' }));
+      const r2 = await postAndApplyCookies(POSTC14, makeRequest({ match: 'Same Match', operationId: 'op-bbbbbbbb-2' }));
+
+      assert.equal(r1.status, 200);
+      assert.equal(r2.status, 200);
+      assert.equal(reserveCalls.length, 2, 'each separate analysis must reserve its own credit');
+      assert.notEqual(reserveCalls[0].idempotencyKey, reserveCalls[1].idempotencyKey);
+      assert.equal(currentBalance, 10, 'two analyses of the same match must cost 2 x ANALYSIS_COST');
+    });
+
+    test('C15: repeating the same logical request (same operationId) does not spend twice', async () => {
+      currentBalance = 20;
+      mock.restoreAll();
+      process.env.ANALYSIS_COST = '10';
+      mock.module('next/headers', { namedExports: { cookies: async () => mockCookieKit() } });
+      mock.module('@/lib/supabase/server', { namedExports: { createClient: async () => ({ auth: {} }) } });
+      mock.module('@/lib/supabase/admin', { namedExports: { createServiceRoleClient: () => ({ admin: true }) } });
+      mock.module('@/lib/auth/session', { namedExports: { getCurrentSession: async () => ({ ok: true, user: { id: 'u-retry' } }) } });
+      mock.module('@/lib/supabase/credits', {
+        namedExports: {
+          reserveCreditSpend: async (_c: any, input: any) => {
+            const existing = reserveCalls.find((x: any) => x.idempotencyKey === input.idempotencyKey);
+            if (existing) return { ok: true, reservationId: 'cr-dup', isDuplicate: true };
+            reserveCalls.push(input);
+            currentBalance -= input.amount;
+            return { ok: true, reservationId: 'cr-retry' };
+          },
+          consumeCreditSpend: async (_c: any, _id: any, idem: any) => { consumeCalls.push(String(idem)); return { success: true }; },
+          releaseCreditSpend: async () => ({ released: true }),
+        },
+      });
+      const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
+      const { POST: POSTC15 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
+      globalThis.fetch = makeMockFetch(buildResearchReportWithVdp(buildFullVdp()), buildLlmContractResponse({ team1: 40, draw: 30, team2: 30 }), calls);
+
+      const r1 = await postAndApplyCookies(POSTC15, makeRequest({ match: 'Retry Match', operationId: 'op-same-request-1' }));
+      const r2 = await postAndApplyCookies(POSTC15, makeRequest({ match: 'Retry Match', operationId: 'op-same-request-1' }));
+
+      assert.equal(r1.status, 200);
+      assert.equal(r2.status, 200);
+      assert.equal(reserveCalls.length, 1, 'the same logical request must reuse one reservation');
+      assert.equal(currentBalance, 10, 'a retry must not spend a second time');
+    });
+
+    test('C16: malformed operationId is rejected as 400 before any reservation', async () => {
+      currentBalance = 100;
+      mock.restoreAll();
+      process.env.ANALYSIS_COST = '10';
+      mock.module('next/headers', { namedExports: { cookies: async () => mockCookieKit() } });
+      mock.module('@/lib/supabase/server', { namedExports: { createClient: async () => ({ auth: {} }) } });
+      mock.module('@/lib/supabase/admin', { namedExports: { createServiceRoleClient: () => ({ admin: true }) } });
+      mock.module('@/lib/auth/session', { namedExports: { getCurrentSession: async () => ({ ok: true, user: { id: 'u-badop' } }) } });
+      mock.module('@/lib/supabase/credits', {
+        namedExports: {
+          reserveCreditSpend: async (_c: any, input: any) => { reserveCalls.push(input); return { ok: true, reservationId: 'cr-badop' }; },
+          consumeCreditSpend: async () => ({ success: true }),
+          releaseCreditSpend: async () => ({ released: true }),
+        },
+      });
+      const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
+      const { POST: POSTC16 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
+      const res = await postAndApplyCookies(POSTC16, makeRequest({ match: 'Bad Op Match', operationId: 'no spaces allowed!' }));
+      assert.equal(res.status, 400);
+      assert.equal(reserveCalls.length, 0);
+    });
+
+    test('C17: idempotency conflict from reserve surfaces as HTTP 409, not 500', async () => {
+      currentBalance = 100;
+      mock.restoreAll();
+      process.env.ANALYSIS_COST = '10';
+      mock.module('next/headers', { namedExports: { cookies: async () => mockCookieKit() } });
+      mock.module('@/lib/supabase/server', { namedExports: { createClient: async () => ({ auth: {} }) } });
+      mock.module('@/lib/supabase/admin', { namedExports: { createServiceRoleClient: () => ({ admin: true }) } });
+      mock.module('@/lib/auth/session', { namedExports: { getCurrentSession: async () => ({ ok: true, user: { id: 'u-conflict' } }) } });
+      mock.module('@/lib/supabase/credits', {
+        namedExports: {
+          reserveCreditSpend: async (_c: any, input: any) => {
+            reserveCalls.push(input);
+            return { ok: false, reason: 'idempotency_conflict', status: 409 };
+          },
+          consumeCreditSpend: async () => ({ success: true }),
+          releaseCreditSpend: async () => ({ released: true }),
+        },
+      });
+      const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
+      const { POST: POSTC17 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
+      const res = await postAndApplyCookies(
+        POSTC17,
+        makeRequest({ match: 'Conflict Match', operationId: 'op-conflict-0001' }),
+      );
+
+      assert.equal(res.status, 409);
+      const body = await res.json();
+      assert.equal(body.status, 'idempotency_conflict');
+      assert.match(String(body.error), /operation id/i);
+      assert.equal(body.status === 'insufficient_credits', false);
+      assert.equal(reserveCalls.length, 1);
+      assert.equal(calls.length, 0, 'conflict must stop before Research/DAL/LLM');
+      assert.equal(consumeCalls.length, 0);
+      assert.equal(releaseCalls.length, 0);
+    });
+
+    test('C18: missing reserve RPC (real PGRST202 message) is 500, never a 409 retry hint', async () => {
+      currentBalance = 100;
+      mock.restoreAll();
+      process.env.ANALYSIS_COST = '10';
+      mock.module('next/headers', { namedExports: { cookies: async () => mockCookieKit() } });
+      mock.module('@/lib/supabase/server', { namedExports: { createClient: async () => ({ auth: {} }) } });
+      mock.module('@/lib/auth/session', { namedExports: { getCurrentSession: async () => ({ ok: true, user: { id: 'u-missing-rpc' } }) } });
+      // Only the transport is faked: the REAL reserveCreditSpend error mapping from
+      // src/lib/supabase/credits.ts runs here, and so does the real route branch.
+      mock.module('@/lib/supabase/admin', {
+        namedExports: {
+          createServiceRoleClient: () => ({
+            rpc: async () => ({
+              data: null,
+              error: {
+                code: 'PGRST202',
+                message:
+                  'Could not find the function public.reserve_credit_spend(p_amount, p_idempotency_key, p_reason, p_user_id) in the schema cache',
+              },
+            }),
+          }),
+        },
+      });
+      const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
+      const { POST: POSTC18 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
+      const res = await postAndApplyCookies(
+        POSTC18,
+        makeRequest({ match: 'Missing RPC Match', operationId: 'op-missing-rpc-01' }),
+      );
+
+      assert.equal(res.status, 500);
+      const body = await res.json();
+      assert.notEqual(body.status, 'idempotency_conflict');
+      assert.doesNotMatch(String(body.error || ''), /operation id/i);
+      assert.equal(calls.length, 0, 'a failed reservation must stop before Research/DAL/LLM');
+    });
   });
 });

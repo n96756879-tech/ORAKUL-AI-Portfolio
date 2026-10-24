@@ -100,6 +100,7 @@ describe('STEP 9: DAL integration behind ORAKUL_DAL_ENABLED', () => {
     process.env.YDC_API_KEY = 'ydc_live_p0test';
     process.env.KEYDEALER_API_KEY = 'kd_live_p0test';
     process.env.ANON_SESSION_SECRET = 'test-anon-session-secret-dal';
+    process.env.ANALYSIS_COST = '10';
     console.log = () => {};
     console.error = () => {};
     console.warn = () => {};
@@ -134,6 +135,7 @@ describe('STEP 9: DAL integration behind ORAKUL_DAL_ENABLED', () => {
     delete process.env.YDC_API_KEY;
     delete process.env.KEYDEALER_API_KEY;
     delete process.env.ANON_SESSION_SECRET;
+    delete process.env.ANALYSIS_COST;
     delete process.env.ORAKUL_DAL_ENABLED;
     getSharedDataPackCache().clear();
     console.log = realLog;

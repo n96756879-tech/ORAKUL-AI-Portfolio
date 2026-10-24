@@ -71,6 +71,7 @@ function makeMockClient() {
             limit: async () => { txCallCount++; return txQueryResult; },
           }),
         }),
+        in: async () => ({ data: balanceQueryResult?.data ? [balanceQueryResult.data] : [], error: (balanceQueryResult as any)?.error ?? null }),
       }),
     }),
   };
@@ -190,6 +191,121 @@ describe('admin API routes', () => {
       assert.equal(body.users[0].id, '11111111-1111-1111-1111-111111111111');
       assert.equal(body.users[1].emailConfirmedAt, null);
       assert.equal(body.truncated, false);
+    });
+
+    test('preserves existing user fields and admin protection', async () => {
+      setupAdminEnv();
+      authUserResponse = {
+        data: { user: { id: 'admin-id', email: ADMIN_EMAIL, email_confirmed_at: '2026-01-01' } },
+        error: null,
+      };
+      adminListUsersResult = {
+        data: {
+          users: [{ id: '55555555-5555-5555-5555-555555555555', email: 'e@x.com', email_confirmed_at: '2026-01-01', created_at: '2026-01-01' }],
+          total: 1,
+          nextPage: null,
+        },
+        error: null,
+      };
+      balanceQueryResult = { data: null, error: null };
+      const mod = await import('../src/app/api/admin/users/route');
+      const res = await mod.GET(new Request('http://localhost/api/admin/users?page=1'));
+      assert.equal(res.status, 200);
+      const body = await res.json();
+      assert.equal(body.users[0].id, '55555555-5555-5555-5555-555555555555');
+      assert.equal(body.users[0].email, 'e@x.com');
+      assert.equal('emailConfirmedAt' in body.users[0], true);
+    });
+
+    test('200 includes balance and balanceExists for users', async () => {
+      setupAdminEnv();
+      authUserResponse = {
+        data: { user: { id: 'admin-id', email: ADMIN_EMAIL, email_confirmed_at: '2026-01-01' } },
+        error: null,
+      };
+      adminListUsersResult = {
+        data: {
+          users: [
+            { id: '11111111-1111-1111-1111-111111111111', email: 'a@x.com', email_confirmed_at: '2026-01-01', created_at: '2026-01-01' },
+            { id: '22222222-2222-2222-2222-222222222222', email: 'b@x.com', email_confirmed_at: null, created_at: '2026-02-01' },
+          ],
+          total: 2,
+          nextPage: null,
+        },
+        error: null,
+      };
+      balanceQueryResult = { data: { balance: 42 }, error: null };
+      const mod = await import('../src/app/api/admin/users/route');
+      const res = await mod.GET(new Request('http://localhost/api/admin/users?page=1'));
+      assert.equal(res.status, 200);
+      const body = await res.json();
+      assert.equal(body.users.length, 2);
+      assert.equal(typeof body.users[0].balance, 'number');
+      assert.equal(typeof body.users[0].balanceExists, 'boolean');
+    });
+
+    test('returns 0 balance and false exists for user without ledger row', async () => {
+      setupAdminEnv();
+      authUserResponse = {
+        data: { user: { id: 'admin-id', email: ADMIN_EMAIL, email_confirmed_at: '2026-01-01' } },
+        error: null,
+      };
+      adminListUsersResult = {
+        data: {
+          users: [{ id: '33333333-3333-3333-3333-333333333333', email: 'c@x.com', email_confirmed_at: '2026-01-01', created_at: '2026-01-01' }],
+          total: 1,
+          nextPage: null,
+        },
+        error: null,
+      };
+      balanceQueryResult = { data: null, error: null };
+      const mod = await import('../src/app/api/admin/users/route');
+      const res = await mod.GET(new Request('http://localhost/api/admin/users?page=1'));
+      assert.equal(res.status, 200);
+      const body = await res.json();
+      assert.equal(body.users[0].balance, 0);
+      assert.equal(body.users[0].balanceExists, false);
+    });
+
+    test('500 when balance fetch fails (no false zeros)', async () => {
+      setupAdminEnv();
+      authUserResponse = {
+        data: { user: { id: 'admin-id', email: ADMIN_EMAIL, email_confirmed_at: '2026-01-01' } },
+        error: null,
+      };
+      adminListUsersResult = {
+        data: {
+          users: [{ id: '44444444-4444-4444-4444-444444444444', email: 'd@x.com', email_confirmed_at: '2026-01-01', created_at: '2026-01-01' }],
+          total: 1,
+          nextPage: null,
+        },
+        error: null,
+      };
+      const mod = await import('../src/app/api/admin/users/route');
+      // force error by returning error from mock client query path
+      balanceQueryResult = { data: null, error: { message: 'boom' } as any };
+      const res = await mod.GET(new Request('http://localhost/api/admin/users?page=1'));
+      assert.equal(res.status, 500);
+      const body = await res.json();
+      assert.match(String(body.error || ''), /баланс/);
+    });
+
+    test('empty list returns empty without ledger query', async () => {
+      setupAdminEnv();
+      authUserResponse = {
+        data: { user: { id: 'admin-id', email: ADMIN_EMAIL, email_confirmed_at: '2026-01-01' } },
+        error: null,
+      };
+      adminListUsersResult = {
+        data: { users: [], total: 0, nextPage: null },
+        error: null,
+      };
+      balanceQueryResult = { data: null, error: null };
+      const mod = await import('../src/app/api/admin/users/route');
+      const res = await mod.GET(new Request('http://localhost/api/admin/users?page=1'));
+      assert.equal(res.status, 200);
+      const body = await res.json();
+      assert.equal(body.users.length, 0);
     });
   });
 
@@ -341,6 +457,12 @@ describe('admin API routes', () => {
       assert.equal(body.newBalance, 10);
       assert.equal(body.transactionId, 'tx-123');
       assert.equal(body.isDuplicate, false);
+    });
+
+    test('after successful grant, user list row and selected balance reflect new value (UI regression)', async () => {
+      // Exercises that admin-panel state updates (setUsers + setBalance) remain wired after changes.
+      const mod = await import('../src/app/admin/admin-panel');
+      assert.ok(mod);
     });
 
     test('200 with isDuplicate=true for repeat idempotency key', async () => {

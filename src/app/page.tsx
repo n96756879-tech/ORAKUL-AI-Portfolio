@@ -98,23 +98,41 @@ export default function Home() {
       setLoadingState('analyzing');
     }, 2200);
 
+    // One identifier per logical analysis: it lets the server reuse a single
+    // credit reservation if this request is repeated, while separate analyses
+    // (even of the same match) remain separately charged.
+    const operationId =
+      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+
     try {
       const response = await fetch('/api/analyze', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ match: matchInput.trim(), sport }),
+        body: JSON.stringify({ match: matchInput.trim(), sport, operationId }),
       });
 
       clearTimeout(searchTimer);
 
       const data = await response.json();
 
-      if (response.status === 402 && data.status === 'auth_required') {
-        await refreshSession();
-        setAuthRequired(true);
-        setErrorMsg(null);
+      if (response.status === 402) {
+        if (data.status === 'auth_required') {
+          await refreshSession();
+          setAuthRequired(true);
+          setErrorMsg(null);
+          setLoadingState('idle');
+          return;
+        }
+        if (data.status === 'insufficient_credits') {
+          setErrorMsg('Недостаточно кредитов. Пополните баланс в Личном кабинете.');
+          setLoadingState('idle');
+          return;
+        }
+        setErrorMsg('Платёжная ошибка. Попробуйте позже или проверьте баланс.');
         setLoadingState('idle');
         return;
       }

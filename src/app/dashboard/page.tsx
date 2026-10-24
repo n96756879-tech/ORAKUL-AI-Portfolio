@@ -2,6 +2,72 @@ import { redirect } from 'next/navigation';
 import Link from 'next/link';
 import { createClient } from '@/lib/supabase/server';
 import { getCurrentSession } from '@/lib/auth/session';
+import { createServiceRoleClient } from '@/lib/supabase/admin';
+import { getBalance } from '@/lib/supabase/credits';
+import { listPredictions } from '@/lib/supabase/predictions';
+import type { PredictionRow } from '@/lib/supabase/predictions';
+
+const ANALYSIS_COST = Number(process.env.ANALYSIS_COST || '0');
+
+const HISTORY_LIMIT = 20;
+
+type HistoryItem = {
+  id: string;
+  matchTitle: string;
+  createdAt: string;
+  outcomes: Array<{ label: string; value: string }>;
+  details: string[];
+};
+
+function readHistoryItem(row: PredictionRow): HistoryItem {
+  const payload = (row.payload ?? {}) as Record<string, any>;
+  const probabilities = (payload.probabilities ?? {}) as Record<string, any>;
+
+  const outcomes = Array.isArray(probabilities.outcomes)
+    ? probabilities.outcomes
+        .filter((item: any) => item && typeof item.label === 'string' && typeof item.value === 'string')
+        .map((item: any) => ({ label: String(item.label), value: String(item.value) }))
+    : [];
+
+  const details: string[] = [];
+  const meta = payload.match && typeof payload.match.meta === 'string' ? payload.match.meta : null;
+  if (meta) details.push(meta);
+
+  if (Array.isArray(probabilities.totals)) {
+    const totals = probabilities.totals
+      .filter((item: any) => item && typeof item.label === 'string' && typeof item.value === 'string')
+      .map((item: any) => `${item.label} ${item.value}`);
+    if (totals.length > 0) details.push(totals.join(' · '));
+  }
+
+  if (Array.isArray(probabilities.btts)) {
+    const btts = probabilities.btts
+      .filter((item: any) => item && typeof item.label === 'string' && typeof item.value === 'string')
+      .map((item: any) => `Обе забьют: ${item.label} ${item.value}`);
+    if (btts.length > 0) details.push(btts.join(' · '));
+  }
+
+  return {
+    id: row.id,
+    matchTitle: row.match_title,
+    createdAt: row.created_at,
+    outcomes,
+    details,
+  };
+}
+
+function formatCreatedAt(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString('ru-RU', {
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    timeZone: 'UTC',
+  });
+}
 
 export const dynamic = 'force-dynamic';
 
@@ -16,6 +82,37 @@ export default async function DashboardPage() {
   const session = await getCurrentSession(supabase);
   if (!session.ok || !session.user) {
     redirect('/auth/login?redirectedFrom=/dashboard');
+  }
+
+  const userId = session.user.id;
+  let credits = 0;
+  let creditsError = false;
+  let history: HistoryItem[] = [];
+  let historyError = false;
+  try {
+    const adminClient = createServiceRoleClient();
+    const bal = await getBalance(adminClient, userId);
+    if (bal.ok) {
+      credits = bal.balance;
+    } else {
+      creditsError = true;
+    }
+  } catch {
+    creditsError = true;
+  }
+
+  try {
+    const adminClient = createServiceRoleClient();
+    const historyResult = await listPredictions(adminClient, userId, HISTORY_LIMIT);
+    if (historyResult.ok) {
+      history = historyResult.predictions
+        .filter((row) => row.user_id === userId)
+        .map(readHistoryItem);
+    } else {
+      historyError = true;
+    }
+  } catch {
+    historyError = true;
   }
 
   const email = session.user.email ?? '—';
@@ -74,6 +171,30 @@ export default async function DashboardPage() {
                   )}
                 </dd>
               </div>
+              <div className="border-t border-slate-800/80 pt-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1">
+                <dt className="text-xs font-mono tracking-wider text-slate-400 uppercase">
+                  Кредиты
+                </dt>
+                <dd className="text-sm font-mono">
+                  {creditsError ? (
+                    <span className="text-red-400">недоступно</span>
+                  ) : (
+                    <span className="text-cyan-400">{credits}</span>
+                  )}
+                </dd>
+              </div>
+              <div className="border-t border-slate-800/80 pt-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1">
+                <dt className="text-xs font-mono tracking-wider text-slate-400 uppercase">
+                  Стоимость анализа
+                </dt>
+                <dd className="text-sm font-mono">
+                  {ANALYSIS_COST > 0 ? (
+                    <span className="text-amber-400">{ANALYSIS_COST}</span>
+                  ) : (
+                    <span className="text-red-400">не настроено</span>
+                  )}
+                </dd>
+              </div>
             </dl>
           </div>
 
@@ -81,9 +202,48 @@ export default async function DashboardPage() {
             <h2 className="text-xs font-mono tracking-wider text-slate-400 uppercase mb-3">
               Мои анализы
             </h2>
-            <p className="text-sm text-slate-400 leading-relaxed">
-              История ваших анализов будет доступна здесь после реализации хранения на уровне аккаунта.
-            </p>
+            {historyError ? (
+              <p className="text-sm text-red-400 leading-relaxed">
+                История прогнозов недоступна. Попробуйте обновить страницу позже.
+              </p>
+            ) : history.length === 0 ? (
+              <p className="text-sm text-slate-400 leading-relaxed">
+                У вас пока нет сохранённых прогнозов.
+              </p>
+            ) : (
+              <ul className="space-y-4">
+                {history.map((item) => (
+                  <li
+                    key={item.id}
+                    className="border-t border-slate-800/80 pt-4 first:border-t-0 first:pt-0"
+                  >
+                    <div className="flex flex-col sm:flex-row sm:items-baseline sm:justify-between gap-1">
+                      <span className="text-sm sm:text-base text-slate-100 font-medium">
+                        {item.matchTitle}
+                      </span>
+                      <span className="text-xs font-mono text-slate-500">
+                        {formatCreatedAt(item.createdAt)}
+                      </span>
+                    </div>
+                    {item.outcomes.length > 0 && (
+                      <dl className="mt-2 flex flex-wrap gap-x-4 gap-y-1">
+                        {item.outcomes.map((outcome) => (
+                          <div key={outcome.label} className="flex items-baseline gap-1">
+                            <dt className="text-xs text-slate-400">{outcome.label}</dt>
+                            <dd className="text-xs font-mono text-cyan-400">{outcome.value}</dd>
+                          </div>
+                        ))}
+                      </dl>
+                    )}
+                    {item.details.length > 0 && (
+                      <p className="mt-2 text-xs text-slate-500 leading-relaxed">
+                        {item.details.join(' · ')}
+                      </p>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
           </div>
 
           <div className="text-center">

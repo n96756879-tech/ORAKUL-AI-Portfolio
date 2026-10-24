@@ -28,6 +28,15 @@ import {
   consumeFreeGeneration,
   releaseFreeGeneration,
 } from '@/lib/supabase/free-limit';
+import { createClient } from '@/lib/supabase/server';
+import { getCurrentSession } from '@/lib/auth/session';
+import { createServiceRoleClient } from '@/lib/supabase/admin';
+import {
+  reserveCreditSpend,
+  consumeCreditSpend,
+  releaseCreditSpend,
+} from '@/lib/supabase/credits';
+import { savePrediction } from '@/lib/supabase/predictions';
 import { cookies } from 'next/headers';
 import { createHmac, randomUUID } from 'crypto';
 
@@ -628,7 +637,9 @@ async function handleHockeyAnalysis(
   trimmedMatch: string,
   ydcApiKey: string,
   keydealerApiKey: string,
-  freeGenReservationId: string | null = null
+  freeGenReservationId: string | null = null,
+  creditSpendReservationId: string | null = null,
+  creditSpendIdemKey: string | null = null
 ) {
   const researchQuery = buildHockeyResearchQuery(trimmedMatch);
   const researchCacheKey = buildResearchCacheKey(researchQuery as any);
@@ -719,6 +730,10 @@ async function handleHockeyAnalysis(
           await releaseFreeGeneration(freeGenReservationId);
           freeGenReservationId = null;
         }
+        if (creditSpendReservationId) {
+          await releaseCreditSpend(createServiceRoleClient(), creditSpendReservationId, creditSpendIdemKey);
+          creditSpendReservationId = null;
+        }
         throw new Error(`You.com Research task ${taskId} failed with status: ${pollStatus}`);
       }
         } else {
@@ -731,6 +746,14 @@ async function handleHockeyAnalysis(
         const lastStatus = lastPollData?.status ? String(lastPollData.status).toLowerCase() : null;
         const lastState = lastPollData?.state != null ? String(lastPollData.state) : null;
         console.log(`[HOCKEY POLL TIMEOUT] polls=${pollCount} elapsed=${Date.now() - startTime}ms lastStatus=${lastStatus} lastState=${lastState}`);
+        if (freeGenReservationId) {
+          await releaseFreeGeneration(freeGenReservationId);
+          freeGenReservationId = null;
+        }
+        if (creditSpendReservationId) {
+          await releaseCreditSpend(createServiceRoleClient(), creditSpendReservationId, creditSpendIdemKey);
+          creditSpendReservationId = null;
+        }
         throw new Error(`You.com Research polling timed out for task ${taskId}`);
       }
 
@@ -757,17 +780,21 @@ async function handleHockeyAnalysis(
     researchSources = researchResult.sources;
   }
 
-  const rawVdpText = extractVDP(researchMarkdown);
-  if (!rawVdpText || rawVdpText.trim().length === 0) {
-    console.error('[ORAKUL HOCKEY] VERIFIED DATA PACK not found in research report. Aborting analysis.');
-    if (freeGenReservationId) {
-      await releaseFreeGeneration(freeGenReservationId);
+    const rawVdpText = extractVDP(researchMarkdown);
+    if (!rawVdpText || rawVdpText.trim().length === 0) {
+      console.error('[ORAKUL HOCKEY] VERIFIED DATA PACK not found in research report. Aborting analysis.');
+      if (freeGenReservationId) {
+        await releaseFreeGeneration(freeGenReservationId);
+      }
+      if (creditSpendReservationId) {
+        await releaseCreditSpend(createServiceRoleClient(), creditSpendReservationId, creditSpendIdemKey);
+        creditSpendReservationId = null;
+      }
+      return NextResponse.json(
+        { error: 'VERIFIED DATA PACK не найден в отчёте исследования. Анализ невозможен.' },
+        { status: 422 }
+      );
     }
-    return NextResponse.json(
-      { error: 'VERIFIED DATA PACK не найден в отчёте исследования. Анализ невозможен.' },
-      { status: 422 }
-    );
-  }
 
   const parsedHockeyVdp = parseHockeyVDP(rawVdpText);
   const engineInput = adaptHockeyVDPToEngineInput(parsedHockeyVdp);
@@ -874,6 +901,11 @@ ${truncatedReport}`;
     await releaseFreeGeneration(freeGenReservationId);
     freeGenReservationId = null;
   }
+  if (creditSpendReservationId) {
+    // success path for authed: consume the reserved spend
+    await consumeCreditSpend(createServiceRoleClient(), creditSpendReservationId, creditSpendIdemKey);
+    creditSpendReservationId = null;
+  }
 
   // Format outcomes for UI compatibility:
   // Primary outcomes show 2-way Final OT/SO probabilities as key market, plus 3-way Regulation in labels/details if needed.
@@ -963,11 +995,22 @@ async function getOrCreateAnonSessionId(): Promise<string> {
 
 export async function POST(req: Request) {
   try {
-    const { match, sport = 'football' } = await req.json();
+    const { match, sport = 'football', operationId } = await req.json();
 
     if (!match || typeof match !== 'string' || match.trim().length === 0) {
       return NextResponse.json(
         { error: 'Не указан матч для анализа. Введите название матча.' },
+        { status: 400 }
+      );
+    }
+
+    // Client-supplied operation identifier: identifies a single logical analysis
+    // (so a retried request reuses one credit reservation). It never influences
+    // the charged user or the price — both stay server-side.
+    const clientOperationId: string | null = typeof operationId === 'string' ? operationId : null;
+    if (clientOperationId !== null && !/^[A-Za-z0-9_-]{8,64}$/.test(clientOperationId)) {
+      return NextResponse.json(
+        { error: 'Некорректный идентификатор операции.' },
         { status: 400 }
       );
     }
@@ -992,24 +1035,91 @@ export async function POST(req: Request) {
 
     const currentDateStr = '2026 год';
 
-    const anonSessionId = await getOrCreateAnonSessionId();
-    const freeLimit = await reserveFreeGeneration(anonSessionId);
-    if (!freeLimit.allowed) {
-      if (freeLimit.reason === 'config_missing') {
-        return NextResponse.json(
-          { error: 'Service unavailable. Please try again later.' },
-          { status: 503 },
-        );
-      }
+    // ── ANALYSIS_COST (server-only, no default, fail closed) ─────────────
+    const ANALYSIS_COST_STR = process.env.ANALYSIS_COST;
+    if (!ANALYSIS_COST_STR || !/^[1-9]\d*$/.test(ANALYSIS_COST_STR)) {
       return NextResponse.json(
-        { status: 'auth_required', message: 'Free generation limit reached. Please sign in.' },
-        { status: 402 },
+        { error: 'Service configuration error.' },
+        { status: 500 },
       );
     }
-    let freeGenReservationId: string | null = freeLimit.reservationId;
+    const ANALYSIS_COST = parseInt(ANALYSIS_COST_STR, 10);
+
+    // ── Auth first: authed users pay with credits, bypass free-limit ────
+    let creditSpendReservationId: string | null = null;
+    let creditSpendIdemKey: string | null = null;
+    let freeGenReservationId: string | null = null;
+    let authedUserId: string | null = null;
+
+    try {
+      const ssrClient = await createClient();
+      const session = await getCurrentSession(ssrClient);
+      if (session.ok && session.user?.id) {
+        authedUserId = session.user.id;
+      }
+    } catch {
+      // fallthrough to anon
+    }
+
+    if (authedUserId) {
+      const adminClient = createServiceRoleClient();
+      // Key identity: the client operation id when present (retry of the same logical
+      // request keeps it), otherwise a deterministic match+price fallback.
+      const idemKey = clientOperationId
+        ? `analysis:${authedUserId}:op:${clientOperationId}`
+        : `analysis:${authedUserId}:m:${trimmedMatch.replace(/\s+/g, ' ').toLowerCase().slice(0, 180)}:${ANALYSIS_COST}`;
+      creditSpendIdemKey = idemKey;
+      const reserveRes = await reserveCreditSpend(adminClient, {
+        userId: authedUserId,
+        amount: ANALYSIS_COST,
+        reason: 'analysis',
+        idempotencyKey: idemKey,
+      });
+      if (!reserveRes.ok) {
+        if (reserveRes.reason === 'insufficient_funds') {
+          return NextResponse.json(
+            { status: 'insufficient_credits', balance: reserveRes.balance ?? 0 },
+            { status: 402 },
+          );
+        }
+        // Same operation id reused for a different amount/match, or replayed after the
+        // reservation was already released. Controlled client conflict, not a server fault.
+        if (reserveRes.reason === 'idempotency_conflict') {
+          return NextResponse.json(
+            {
+              status: 'idempotency_conflict',
+              error: 'This operation conflicts with a previous credit operation. Please retry with a new operation id.',
+            },
+            { status: 409 },
+          );
+        }
+        return NextResponse.json(
+          { error: 'Credit reservation failed.' },
+          { status: 500 },
+        );
+      }
+      creditSpendReservationId = reserveRes.reservationId;
+    } else {
+      // Anonymous free-limit path (unchanged semantics)
+      const anonSessionId = await getOrCreateAnonSessionId();
+      const freeLimit = await reserveFreeGeneration(anonSessionId);
+      if (!freeLimit.allowed) {
+        if (freeLimit.reason === 'config_missing') {
+          return NextResponse.json(
+            { error: 'Service unavailable. Please try again later.' },
+            { status: 503 },
+          );
+        }
+        return NextResponse.json(
+          { status: 'auth_required', message: 'Free generation limit reached. Please sign in.' },
+          { status: 402 },
+        );
+      }
+      freeGenReservationId = freeLimit.reservationId;
+    }
 
     if (sport === 'hockey') {
-      return await handleHockeyAnalysis(trimmedMatch, ydcApiKey, keydealerApiKey, freeGenReservationId);
+      return await handleHockeyAnalysis(trimmedMatch, ydcApiKey, keydealerApiKey, freeGenReservationId, creditSpendReservationId, creditSpendIdemKey);
     }
 
     const researchQuery = matchQueryFromFreeForm(trimmedMatch);
@@ -1746,6 +1856,10 @@ K. Финальный JSON соответствует существующему
         }
         freeGenReservationId = null;
       }
+      if (creditSpendReservationId) {
+        await releaseCreditSpend(createServiceRoleClient(), creditSpendReservationId, creditSpendIdemKey);
+        creditSpendReservationId = null;
+      }
       return NextResponse.json(
         { error: 'VERIFIED DATA PACK не найден в отчёте исследования. Анализ невозможно.' },
         { status: 422 }
@@ -1776,6 +1890,10 @@ K. Финальный JSON соответствует существующему
           console.error(`[ORAKUL] free generation reservation NOT released: reservationId=${freeGenReservationId} reason=${releaseResult.reason}`);
         }
         freeGenReservationId = null;
+      }
+      if (creditSpendReservationId) {
+        await releaseCreditSpend(createServiceRoleClient(), creditSpendReservationId, creditSpendIdemKey);
+        creditSpendReservationId = null;
       }
       return NextResponse.json(
         { error: 'VERIFIED DATA PACK невалиден: недостаточно данных для расчёта вероятностей.' },
@@ -1911,6 +2029,10 @@ ${JSON.stringify(goalDistributionForLlm)}
           }
           freeGenReservationId = null;
         }
+        if (creditSpendReservationId) {
+          await releaseCreditSpend(createServiceRoleClient(), creditSpendReservationId, creditSpendIdemKey);
+          creditSpendReservationId = null;
+        }
         return NextResponse.json(
           { error: `LLM API connection error: ${safeLLMErr}` },
           { status: 502 }
@@ -1931,6 +2053,10 @@ ${JSON.stringify(goalDistributionForLlm)}
             console.error(`[ORAKUL] free generation reservation NOT released: reservationId=${freeGenReservationId} reason=${releaseResult.reason}`);
           }
           freeGenReservationId = null;
+        }
+        if (creditSpendReservationId) {
+          await releaseCreditSpend(createServiceRoleClient(), creditSpendReservationId, creditSpendIdemKey);
+          creditSpendReservationId = null;
         }
         return NextResponse.json(
           { error: `LLM API error: HTTP ${chatRes.status} — ${safeErrBody}` },
@@ -1974,27 +2100,6 @@ ${JSON.stringify(goalDistributionForLlm)}
         if (llmAttempt === 1) {
           console.log('[LLM] JSON retry failed');
         }
-        if (freeGenReservationId) {
-          const releaseResult = await releaseFreeGeneration(freeGenReservationId);
-          if (!releaseResult.released) {
-            console.error(`[ORAKUL] free generation reservation NOT released: reservationId=${freeGenReservationId} reason=${releaseResult.reason}`);
-          }
-          freeGenReservationId = null;
-        }
-        return NextResponse.json(
-          { error: 'LLM response was not valid JSON.' },
-          { status: 502 }
-        );
-      }
-    }
-
-    if (parsedAfterRetry) {
-      console.log('[LLM] JSON retry succeeded');
-    }
-
-    const contract = buildAnalysisContract(rawParsed);
-    if (!contract) {
-      console.log('[ORAKUL DIAGNOSTIC] LLM returned non-object payload:', JSON.stringify(String(rawParsed).slice(0, 300)));
       if (freeGenReservationId) {
         const releaseResult = await releaseFreeGeneration(freeGenReservationId);
         if (!releaseResult.released) {
@@ -2002,11 +2107,40 @@ ${JSON.stringify(goalDistributionForLlm)}
         }
         freeGenReservationId = null;
       }
+      if (creditSpendReservationId) {
+        await releaseCreditSpend(createServiceRoleClient(), creditSpendReservationId, creditSpendIdemKey);
+        creditSpendReservationId = null;
+      }
       return NextResponse.json(
-        { error: 'LLM response had an unexpected structure.' },
+        { error: 'LLM response was not valid JSON.' },
         { status: 502 }
       );
     }
+  }
+
+  if (parsedAfterRetry) {
+    console.log('[LLM] JSON retry succeeded');
+  }
+
+  const contract = buildAnalysisContract(rawParsed);
+  if (!contract) {
+    console.log('[ORAKUL DIAGNOSTIC] LLM returned non-object payload:', JSON.stringify(String(rawParsed).slice(0, 300)));
+    if (freeGenReservationId) {
+      const releaseResult = await releaseFreeGeneration(freeGenReservationId);
+      if (!releaseResult.released) {
+        console.error(`[ORAKUL] free generation reservation NOT released: reservationId=${freeGenReservationId} reason=${releaseResult.reason}`);
+      }
+      freeGenReservationId = null;
+    }
+    if (creditSpendReservationId) {
+      await releaseCreditSpend(createServiceRoleClient(), creditSpendReservationId, creditSpendIdemKey);
+      creditSpendReservationId = null;
+    }
+    return NextResponse.json(
+      { error: 'LLM response had an unexpected structure.' },
+      { status: 502 }
+    );
+  }
 
     // Если LLM не вернул match (или вернул пустую строку) — используем исходный пользовательский запрос.
     contract.match = contract.match || trimmedMatch;
@@ -2043,6 +2177,10 @@ ${JSON.stringify(goalDistributionForLlm)}
         }
         freeGenReservationId = null;
       }
+      if (creditSpendReservationId) {
+        await releaseCreditSpend(createServiceRoleClient(), creditSpendReservationId, creditSpendIdemKey);
+        creditSpendReservationId = null;
+      }
       return NextResponse.json(
         { error: `LLM response failed validation: ${validationError}` },
         { status: 502 }
@@ -2053,15 +2191,59 @@ ${JSON.stringify(goalDistributionForLlm)}
     const publicProbabilities = response.probabilities.outcomes.map((outcome: { value: string }) => toProbabilityNumber(outcome.value));
     console.log('[ORAKUL DIAGNOSTIC] Public Response probabilities:', `team1=${publicProbabilities[0]} draw=${publicProbabilities[1]} team2=${publicProbabilities[2]}`);
 
-    const consumeResult = await consumeFreeGeneration(freeGenReservationId);
-    if (!consumeResult.success) {
-      console.error('[ORAKUL] CRITICAL: consumeFreeGeneration failed after successful final response. Reservation left unconsumed to prevent double-use. reservationId:', freeGenReservationId);
-      return NextResponse.json(
-        { error: 'Internal accounting error. The result was not delivered to avoid unaccounted free generation.' },
-        { status: 500 }
-      );
+    if (creditSpendReservationId) {
+      const adminClient = createServiceRoleClient();
+      const consumeRes = await consumeCreditSpend(adminClient, creditSpendReservationId, creditSpendIdemKey);
+      if (!consumeRes.success) {
+        console.error('[ORAKUL] CRITICAL: consumeCreditSpend failed after success. Reservation left unconsumed. id=', creditSpendReservationId);
+        return NextResponse.json(
+          { error: 'Internal accounting error. The result was not delivered to avoid unaccounted credit spend.' },
+          { status: 500 }
+        );
+      }
+
+      // History is an additional feature, never a reason to re-charge or to withhold a
+      // result that has already been paid for. A failure here is logged and ignored.
+      if (authedUserId) {
+        const historyIdemKey =
+          creditSpendIdemKey ?? `analysis:${authedUserId}:res:${creditSpendReservationId}`;
+        try {
+          const saved = await savePrediction(adminClient, {
+            userId: authedUserId,
+            sport: 'football',
+            matchTitle: response.match.title,
+            payload: response as unknown as Record<string, unknown>,
+            idempotencyKey: historyIdemKey,
+          });
+          if (!saved.ok) {
+            console.error('[ORAKUL] prediction history NOT saved:', {
+              status: saved.status,
+              error: saved.error,
+            });
+          }
+        } catch (historyErr: any) {
+          console.error('[ORAKUL] prediction history NOT saved (unexpected error):', {
+            message: historyErr?.message ? String(historyErr.message) : 'unknown',
+          });
+        }
+      }
+
+      creditSpendReservationId = null;
+      return NextResponse.json(response);
     }
-    freeGenReservationId = null;
+
+    // free anon path
+    if (freeGenReservationId) {
+      const consumeResult = await consumeFreeGeneration(freeGenReservationId);
+      if (!consumeResult.success) {
+        console.error('[ORAKUL] CRITICAL: consumeFreeGeneration failed after successful final response. Reservation left unconsumed to prevent double-use. reservationId:', freeGenReservationId);
+        return NextResponse.json(
+          { error: 'Internal accounting error. The result was not delivered to avoid unaccounted free generation.' },
+          { status: 500 }
+        );
+      }
+      freeGenReservationId = null;
+    }
     return NextResponse.json(response);
   } catch (error: any) {
     const msg = error?.message || String(error);

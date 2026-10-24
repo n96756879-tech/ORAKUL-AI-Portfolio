@@ -126,6 +126,39 @@ export async function grantCredits(
   };
 }
 
+export async function getBalances(
+  client: SupabaseClient,
+  userIds: string[],
+): Promise<
+  | { ok: true; balances: Record<string, { balance: number; exists: boolean }> }
+  | { ok: false; error: string; status: number }
+> {
+  if (!userIds || userIds.length === 0) {
+    return { ok: true, balances: {} };
+  }
+  const { data, error } = await client
+    .from('credit_balances')
+    .select('user_id, balance')
+    .in('user_id', userIds);
+  if (error) {
+    return { ok: false, error: 'Ошибка при получении балансов.', status: 500 };
+  }
+  const result: Record<string, { balance: number; exists: boolean }> = {};
+  for (const id of userIds) {
+    result[id] = { balance: 0, exists: false };
+  }
+  for (const row of data ?? []) {
+    const uid = (row as { user_id?: string; balance?: number }).user_id;
+    if (uid) {
+      result[uid] = {
+        balance: (row as { balance?: number }).balance ?? 0,
+        exists: true,
+      };
+    }
+  }
+  return { ok: true, balances: result };
+}
+
 export async function getBalance(
   client: SupabaseClient,
   userId: string,
@@ -164,4 +197,107 @@ export async function listTransactions(
   }
 
   return { ok: true, transactions: (data ?? []) as TransactionRow[] };
+}
+
+// ── Credit spend (reserve/consume/release) for ANALYSIS_COST ──────────────
+// These call server-only RPCs. RPCs are defined in a separate migration (not applied here).
+// Contract mirrors grant but for negative spend with reservation lifecycle.
+
+export type CreditSpendInput = {
+  userId: string;
+  amount: number;
+  reason: string;
+  idempotencyKey: string;
+};
+
+export type CreditSpendReserveResult =
+  | { ok: true; reservationId: string; balanceAfter?: number }
+  | { ok: false; reason: 'insufficient_funds' | 'idempotency_conflict' | 'user_not_found' | 'config' | string; balance?: number; status?: number };
+
+export type CreditSpendConsumeResult =
+  | { success: true }
+  | { success: false; reason?: string };
+
+export type CreditSpendReleaseResult =
+  | { released: true }
+  | { released: false; reason?: string };
+
+export async function reserveCreditSpend(
+  client: SupabaseClient,
+  input: CreditSpendInput,
+): Promise<CreditSpendReserveResult> {
+  const { data, error } = await client.rpc('reserve_credit_spend', {
+    p_user_id: input.userId,
+    p_amount: input.amount,
+    p_reason: input.reason,
+    p_idempotency_key: input.idempotencyKey,
+  });
+  if (error) {
+    const msg = String(error.message || '');
+    const code = (error as any).code || '';
+    // PostgREST-level failures (PGRSTxxx) mean the call never reached the function: most
+    // importantly PGRST202 'Could not find the function ...(... p_idempotency_key ...)',
+    // whose message echoes the parameter names. Treating those as a conflict told the client
+    // to retry with a new operation id, which cannot fix a missing/stale RPC.
+    const isPostgrestError = typeof code === 'string' && code.startsWith('PGRST');
+    if (isPostgrestError) {
+      return { ok: false, reason: 'db_error', status: 500 };
+    }
+    if (code === '40901' || msg.includes('idempotency') || msg.includes('conflict')) {
+      return { ok: false, reason: 'idempotency_conflict', status: 409 };
+    }
+    if (msg.includes('insufficient') || msg.includes('balance')) {
+      return { ok: false, reason: 'insufficient_funds', status: 402 };
+    }
+    if (msg.includes('user') && msg.includes('not')) {
+      return { ok: false, reason: 'user_not_found', status: 404 };
+    }
+    return { ok: false, reason: 'db_error', status: 500 };
+  }
+  const rows = data as Array<{ reservation_id?: string; balance_after?: number } | null> | null;
+  const row = rows?.[0];
+  if (!row || !row.reservation_id) {
+    return { ok: false, reason: 'invalid_response', status: 500 };
+  }
+  return { ok: true, reservationId: row.reservation_id, balanceAfter: row.balance_after };
+}
+
+export async function consumeCreditSpend(
+  client: SupabaseClient,
+  reservationId: string,
+  idempotencyKey: string | null = null,
+): Promise<CreditSpendConsumeResult> {
+  const { data, error } = await client.rpc('consume_credit_spend', {
+    p_reservation_id: reservationId,
+    p_idempotency_key: idempotencyKey || '',
+  });
+  if (error) {
+    return { success: false, reason: String(error.message || 'consume_failed') };
+  }
+  // PostgREST returns RETURNS TABLE as an array of rows.
+  const row = Array.isArray(data) ? (data[0] as { success?: unknown } | undefined) : undefined;
+  if (!row || typeof row !== 'object' || row.success !== true) {
+    return { success: false, reason: 'invalid_response' };
+  }
+  return { success: true };
+}
+
+export async function releaseCreditSpend(
+  client: SupabaseClient,
+  reservationId: string,
+  idempotencyKey: string | null = null,
+): Promise<CreditSpendReleaseResult> {
+  const { data, error } = await client.rpc('release_credit_spend', {
+    p_reservation_id: reservationId,
+    p_idempotency_key: idempotencyKey || '',
+  });
+  if (error) {
+    return { released: false, reason: String(error.message || 'release_failed') };
+  }
+  // PostgREST returns RETURNS TABLE as an array of rows.
+  const row = Array.isArray(data) ? (data[0] as { released?: unknown } | undefined) : undefined;
+  if (!row || typeof row !== 'object' || row.released !== true) {
+    return { released: false, reason: 'invalid_response' };
+  }
+  return { released: true };
 }

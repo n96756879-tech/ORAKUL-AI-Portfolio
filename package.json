@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "test:p0": "tsx --experimental-test-module-mocks --test-concurrency=1 --test tests/p0-vdp-parser.test.ts tests/p0-vdp-extractor.test.ts tests/p0-probability-engine.test.ts tests/p0-api.test.ts tests/p0-free-limit.test.ts tests/p0-auth.test.ts tests/p0-auth-routes.test.ts tests/p0-dashboard.test.ts tests/p0-engine-authoritative.test.ts tests/p0-dal.test.ts tests/p0-dal-integration.test.ts tests/p0-dal-fetch.test.ts tests/p0-dal-form.test.ts tests/p0-dal-form-integration.test.ts tests/p0-engine-bridge.test.ts tests/p0-h2h.test.ts tests/p0-research-cache.test.ts tests/p0-historical-context.test.ts"
+    "test:p0": "tsx --experimental-test-module-mocks --test-concurrency=1 --test tests/p0-vdp-parser.test.ts tests/p0-vdp-extractor.test.ts tests/p0-probability-engine.test.ts tests/p0-api.test.ts tests/p0-free-limit.test.ts tests/p0-auth.test.ts tests/p0-auth-routes.test.ts tests/p0-dashboard.test.ts tests/p0-engine-authoritative.test.ts tests/p0-dal.test.ts tests/p0-dal-integration.test.ts tests/p0-dal-fetch.test.ts tests/p0-dal-form.test.ts tests/p0-dal-form-integration.test.ts tests/p0-engine-bridge.test.ts tests/p0-h2h.test.ts tests/p0-research-cache.test.ts tests/p0-historical-context.test.ts tests/p0-admin-guard.test.ts tests/p0-admin-credits.test.ts tests/p0-credit-spend.test.ts tests/p0-admin-routes.test.ts tests/p0-prediction-history.test.ts"
   },
   "dependencies": {
     "@supabase/ssr": "^0.12.7",

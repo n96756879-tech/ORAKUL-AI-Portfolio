@@ -73,6 +73,7 @@ describe('A1: engine probabilities remain authoritative over LLM probabilities',
     process.env.YDC_API_KEY = 'ydc_live_a1test';
     process.env.KEYDEALER_API_KEY = 'kd_live_a1test';
     process.env.ANON_SESSION_SECRET = 'test-anon-session-secret-a1';
+    process.env.ANALYSIS_COST = '10';
     console.log = () => {};
     console.error = () => {};
     console.warn = () => {};
@@ -118,6 +119,7 @@ describe('A1: engine probabilities remain authoritative over LLM probabilities',
     delete process.env.YDC_API_KEY;
     delete process.env.KEYDEALER_API_KEY;
     delete process.env.ANON_SESSION_SECRET;
+    delete process.env.ANALYSIS_COST;
     console.log = realLog;
     console.error = realErr;
     console.warn = realWarn;

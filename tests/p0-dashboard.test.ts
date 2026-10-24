@@ -8,6 +8,12 @@ type SessionResult =
 let sessionResult: SessionResult;
 let createClientCalls = 0;
 let redirectTarget: string | null = null;
+let getBalanceResult: { ok: true; balance: number; exists: boolean } | { ok: false; error: string; status: number } = { ok: true, balance: 0, exists: false };
+let getBalanceCalls = 0;
+let listPredictionsResult:
+  | { ok: true; predictions: Array<Record<string, unknown>> }
+  | { ok: false; error: string; status: number } = { ok: true, predictions: [] };
+let listPredictionsCalls: Array<{ userId: unknown; limit: unknown }> = [];
 
 mock.module('next/navigation', {
   namedExports: {
@@ -43,6 +49,30 @@ mock.module('@/lib/auth/session', {
   },
 });
 
+mock.module('@/lib/supabase/admin', {
+  namedExports: {
+    createServiceRoleClient: () => ({}),
+  },
+});
+
+mock.module('@/lib/supabase/credits', {
+  namedExports: {
+    getBalance: async () => {
+      getBalanceCalls += 1;
+      return getBalanceResult;
+    },
+  },
+});
+
+mock.module('@/lib/supabase/predictions', {
+  namedExports: {
+    listPredictions: async (_client: unknown, userId: unknown, limit: unknown) => {
+      listPredictionsCalls.push({ userId, limit });
+      return listPredictionsResult;
+    },
+  },
+});
+
 async function loadPage() {
   const mod = await import('../src/app/dashboard/page');
   return mod.default;
@@ -52,7 +82,11 @@ describe('GET /dashboard (server component)', () => {
   beforeEach(() => {
     createClientCalls = 0;
     redirectTarget = null;
+    getBalanceCalls = 0;
+    listPredictionsCalls = [];
+    listPredictionsResult = { ok: true, predictions: [] };
     sessionResult = { ok: true, user: null };
+    getBalanceResult = { ok: true, balance: 0, exists: false };
   });
 
   test('redirects to login with redirectedFrom when session is not ok', async () => {
@@ -119,7 +153,7 @@ describe('GET /dashboard (server component)', () => {
     assert.match(tree, /Не подтверждён/);
   });
 
-  test('renders analyses placeholder without fake history data', async () => {
+  test('renders an empty history state for a user without saved predictions', async () => {
     sessionResult = {
       ok: true,
       user: {
@@ -128,12 +162,173 @@ describe('GET /dashboard (server component)', () => {
         email_confirmed_at: '2026-01-01T00:00:00Z',
       },
     };
+    getBalanceResult = { ok: true, balance: 0, exists: false };
     const DashboardPage = await loadPage();
 
     const el: any = await DashboardPage();
     const tree = JSON.stringify(el);
     assert.match(tree, /Мои анализы/);
-    assert.doesNotMatch(tree, /баланс/i);
+    assert.match(tree, /У вас пока нет сохранённых прогнозов/);
     assert.doesNotMatch(tree, /количество генераций/i);
+    assert.deepEqual(listPredictionsCalls, [{ userId: 'u', limit: 20 }]);
+  });
+
+  test('renders saved predictions for the current user only', async () => {
+    sessionResult = {
+      ok: true,
+      user: {
+        id: 'u-history',
+        email: 'h@b.co',
+        email_confirmed_at: '2026-01-01T00:00:00Z',
+      },
+    };
+    listPredictionsResult = {
+      ok: true,
+      predictions: [
+        {
+          id: 'pred-1',
+          user_id: 'u-history',
+          sport: 'football',
+          match_title: 'Спартак vs Зенит',
+          payload: {
+            status: 'success',
+            match: { title: 'Спартак vs Зенит', meta: 'Анализ на основе исследования' },
+            probabilities: {
+              outcomes: [
+                { label: 'Победа Команды 1', value: '45%' },
+                { label: 'Ничья', value: '27%' },
+                { label: 'Победа Команды 2', value: '28%' },
+              ],
+              totals: [{ label: 'ТБ 2.5', value: '54%' }],
+              btts: [{ label: 'Да', value: '58%' }],
+            },
+          },
+          idempotency_key: 'analysis:u-history:op:op-1',
+          created_at: '2026-05-06T12:30:00.000Z',
+        },
+      ],
+    };
+    const DashboardPage = await loadPage();
+    const el: any = await DashboardPage();
+    const tree = JSON.stringify(el);
+
+    assert.deepEqual(listPredictionsCalls, [{ userId: 'u-history', limit: 20 }]);
+    assert.match(tree, /Спартак vs Зенит/);
+    assert.match(tree, /Победа Команды 1/);
+    assert.match(tree, /45%/);
+    assert.match(tree, /Ничья/);
+    assert.match(tree, /27%/);
+    assert.match(tree, /Победа Команды 2/);
+    assert.match(tree, /28%/);
+    assert.match(tree, /ТБ 2\.5 54%/);
+    assert.match(tree, /Обе забьют: Да 58%/);
+    assert.match(tree, /06\.05\.2026, 12:30/);
+    assert.doesNotMatch(tree, /У вас пока нет сохранённых прогнозов/);
+  });
+
+  test('does not leak another user rows even if the query returned them', async () => {
+    sessionResult = {
+      ok: true,
+      user: {
+        id: 'u-mine',
+        email: 'm@b.co',
+        email_confirmed_at: '2026-01-01T00:00:00Z',
+      },
+    };
+    listPredictionsResult = {
+      ok: true,
+      predictions: [
+        {
+          id: 'pred-foreign',
+          user_id: 'u-someone-else',
+          sport: 'football',
+          match_title: 'Чужой матч',
+          payload: { match: { title: 'Чужой матч' } },
+          idempotency_key: 'k-foreign',
+          created_at: '2026-01-01T00:00:00.000Z',
+        },
+      ],
+    };
+    const DashboardPage = await loadPage();
+    const el: any = await DashboardPage();
+    const tree = JSON.stringify(el);
+
+    assert.deepEqual(listPredictionsCalls, [{ userId: 'u-mine', limit: 20 }]);
+    assert.doesNotMatch(tree, /Чужой матч/);
+  });
+
+  test('shows a safe history error state without breaking the balance block', async () => {
+    sessionResult = {
+      ok: true,
+      user: {
+        id: 'u-err',
+        email: 'err@b.co',
+        email_confirmed_at: '2026-01-01T00:00:00Z',
+      },
+    };
+    getBalanceResult = { ok: true, balance: 7, exists: true };
+    listPredictionsResult = { ok: false, error: 'boom', status: 500 };
+    const DashboardPage = await loadPage();
+    const el: any = await DashboardPage();
+    const tree = JSON.stringify(el);
+
+    assert.match(tree, /История прогнозов недоступна/);
+    assert.doesNotMatch(tree, /boom/);
+    assert.match(tree, /Кредиты/i);
+    assert.match(tree, /7/);
+  });
+
+  test('renders positive credit balance', async () => {
+    sessionResult = {
+      ok: true,
+      user: {
+        id: 'u1',
+        email: 'p@x.com',
+        email_confirmed_at: '2026-01-01T00:00:00Z',
+      },
+    };
+    getBalanceResult = { ok: true, balance: 50, exists: true };
+    const DashboardPage = await loadPage();
+    const el: any = await DashboardPage();
+    const tree = JSON.stringify(el);
+    assert.match(tree, /50/);
+    assert.match(tree, /Кредиты/i);
+    assert.equal(getBalanceCalls >= 1, true);
+  });
+
+  test('renders zero credit balance when ledger row missing', async () => {
+    sessionResult = {
+      ok: true,
+      user: {
+        id: 'u2',
+        email: 'z@x.com',
+        email_confirmed_at: '2026-01-01T00:00:00Z',
+      },
+    };
+    getBalanceResult = { ok: true, balance: 0, exists: false };
+    const DashboardPage = await loadPage();
+    const el: any = await DashboardPage();
+    const tree = JSON.stringify(el);
+    assert.match(tree, /0/);
+    assert.match(tree, /Кредиты/i);
+  });
+
+  test('shows error state for balance fetch failure (not masked as zero)', async () => {
+    sessionResult = {
+      ok: true,
+      user: {
+        id: 'u3',
+        email: 'e@x.com',
+        email_confirmed_at: '2026-01-01T00:00:00Z',
+      },
+    };
+    getBalanceResult = { ok: false, error: 'fail', status: 500 };
+    const DashboardPage = await loadPage();
+    const el: any = await DashboardPage();
+    const tree = JSON.stringify(el);
+    assert.match(tree, /недоступно/i);
+    // ensure the rendered value is the error indicator, not a numeric 0 from ledger
+    assert.match(tree, /недоступно/i);
+    assert.doesNotMatch(tree, /"Кредиты"[^}]*0/);
   });
 });
