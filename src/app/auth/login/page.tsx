@@ -95,6 +95,12 @@ function LoginForm() {
         </form>
 
         <p className="text-center text-sm text-slate-500">
+          <Link href="/auth/forgot-password" className="text-cyan-400 hover:text-cyan-300">
+            Забыли пароль?
+          </Link>
+        </p>
+
+        <p className="text-center text-sm text-slate-500">
           Нет аккаунта?{' '}
           <Link href="/auth/signup" className="text-cyan-400 hover:text-cyan-300">
             Зарегистрироваться

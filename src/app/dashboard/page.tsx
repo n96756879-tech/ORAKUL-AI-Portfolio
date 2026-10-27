@@ -6,6 +6,9 @@ import { createServiceRoleClient } from '@/lib/supabase/admin';
 import { getBalance } from '@/lib/supabase/credits';
 import { listPredictions } from '@/lib/supabase/predictions';
 import type { PredictionRow } from '@/lib/supabase/predictions';
+import { COMMERCIAL_TERMS } from '@/lib/legal/commercial';
+import { readPaymentsConfig } from '@/lib/payments/config';
+import TopUpForm from '@/components/payments/top-up-form';
 
 const ANALYSIS_COST = Number(process.env.ANALYSIS_COST || '0');
 
@@ -118,6 +121,7 @@ export default async function DashboardPage() {
   const email = session.user.email ?? '—';
   const emailConfirmedAt = session.user.email_confirmed_at ?? null;
   const emailConfirmed = !!emailConfirmedAt;
+  const paymentsEnabled = readPaymentsConfig().enabled;
 
   return (
     <main className="min-h-screen bg-[#090d16] text-slate-100 flex flex-col items-center justify-start p-4 sm:p-6 lg:p-12 relative overflow-x-hidden">
@@ -185,6 +189,16 @@ export default async function DashboardPage() {
               </div>
               <div className="border-t border-slate-800/80 pt-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1">
                 <dt className="text-xs font-mono tracking-wider text-slate-400 uppercase">
+                  Смена пароля
+                </dt>
+                <dd className="text-sm">
+                  <Link href="/auth/forgot-password" className="text-cyan-400 hover:text-cyan-300">
+                    Восстановить доступ
+                  </Link>
+                </dd>
+              </div>
+              <div className="border-t border-slate-800/80 pt-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1">
+                <dt className="text-xs font-mono tracking-wider text-slate-400 uppercase">
                   Стоимость анализа
                 </dt>
                 <dd className="text-sm font-mono">
@@ -197,6 +211,12 @@ export default async function DashboardPage() {
               </div>
             </dl>
           </div>
+
+          <TopUpForm
+            minTopUpRubles={COMMERCIAL_TERMS.minTopUpRubles}
+            rublesPerCredit={COMMERCIAL_TERMS.rublesPerCredit}
+            paymentsEnabled={paymentsEnabled}
+          />
 
           <div className="rounded-2xl border border-slate-800 bg-slate-900/50 backdrop-blur-xl px-6 py-5">
             <h2 className="text-xs font-mono tracking-wider text-slate-400 uppercase mb-3">

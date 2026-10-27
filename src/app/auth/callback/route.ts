@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import type { EmailOtpType } from '@supabase/supabase-js';
 import { createClient } from '@/lib/supabase/server';
 import { AUTH_AFTER_CONFIRM_PATH } from '@/lib/auth/server';
+import { isRecoverySession } from '@/lib/auth/recovery';
 
 function safeNextPath(value: string | null): string {
   if (!value) return '/';
@@ -28,24 +29,33 @@ export async function GET(request: Request) {
   }
 
   if (code) {
-    const { error } = await supabase.auth.exchangeCodeForSession(code);
-    if (error) {
+    const { data, error } = await supabase.auth.exchangeCodeForSession(code);
+    if (error || !data.session) {
       return NextResponse.redirect(
         `${redirectBase}?status=error&reason=exchange`,
       );
+    }
+    const isRecovery = isRecoverySession(data.session.user ?? null);
+    if (isRecovery) {
+      return NextResponse.redirect(`${url.origin}/auth/reset-password`);
     }
     return NextResponse.redirect(`${url.origin}${next}`);
   }
 
   if (tokenHash && type) {
-    const { error } = await supabase.auth.verifyOtp({
+    const { data, error } = await supabase.auth.verifyOtp({
       token_hash: tokenHash,
       type: type as EmailOtpType,
     });
-    if (error) {
+    if (error || !data.session) {
       return NextResponse.redirect(
         `${redirectBase}?status=error&reason=otp`,
       );
+    }
+    const isRecovery =
+      type === 'recovery' || isRecoverySession(data.session.user ?? null);
+    if (isRecovery) {
+      return NextResponse.redirect(`${url.origin}/auth/reset-password`);
     }
     return NextResponse.redirect(`${url.origin}${next}`);
   }
