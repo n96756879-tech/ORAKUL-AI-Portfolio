@@ -130,12 +130,12 @@ const CROSS_LANG_ALIAS_GROUPS: Array<string[]> = [
   ['dynamo kyiv', 'динамо киев'],
   ['zenit', 'зенит'],
   ['cska moscow', 'цска москва'],
-  ['spartak moscow', 'спартак москва'],
+  ['spartak moscow', 'спартак москва', 'спартак м', 'spartak m', 'spartak moskva'],
   ['lokomotiv moscow', 'локомотив москва'],
   ['dynamo moscow', 'динамо москва'],
   ['krasnodar', 'краснодар'],
   ['rostov', 'ростов'],
-  ['rubin kazan', 'рубин казань'],
+  ['rubin kazan', 'рубин казань', 'рубин', 'rubin'],
 ];
 
 // Ключи карты — имена, нормализованные той же функцией, которая применяется

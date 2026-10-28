@@ -121,6 +121,40 @@ describe('verifyMatchTeams', () => {
     const result = verifyMatchTeams('Венеция — Интер', 'Venezia FC', 'Juventus');
     assert.deepEqual(result, { ok: false, reason: 'teams_mismatch' });
   });
+
+  test('passes production case: спартак м - рубин ↔ Spartak Moscow, Rubin Kazan', () => {
+    const result = verifyMatchTeams('спартак м - рубин', 'Spartak Moscow', 'Rubin Kazan');
+    assert.deepEqual(result, { ok: true });
+  });
+
+  test('passes Spartak/Rubin full-name variants across RU and Latin forms', () => {
+    assert.deepEqual(verifyMatchTeams('Спартак М — Рубин', 'Спартак Москва', 'Рубин Казань'), { ok: true });
+    assert.deepEqual(verifyMatchTeams('Спартак Москва — Рубин Казань', 'Spartak Moskva', 'Rubin'), { ok: true });
+    assert.deepEqual(verifyMatchTeams('Spartak M - Rubin Kazan', 'Spartak Moscow', 'Rubin Kazan'), { ok: true });
+  });
+
+  test('rejects спартак м when VDP has a different club', () => {
+    assert.deepEqual(verifyMatchTeams('спартак м - рубин', 'Spartak Trnava', 'Rubin Kazan'), {
+      ok: false,
+      reason: 'teams_mismatch',
+    });
+    assert.deepEqual(verifyMatchTeams('спартак м - рубин', 'Lokomotiv Moscow', 'Rubin Kazan'), {
+      ok: false,
+      reason: 'teams_mismatch',
+    });
+  });
+
+  test('rejects рубин when VDP guest is a different club', () => {
+    assert.deepEqual(verifyMatchTeams('спартак м - рубин', 'Spartak Moscow', 'Rostov'), {
+      ok: false,
+      reason: 'teams_mismatch',
+    });
+  });
+
+  test('rejects swapped order for short Spartak/Rubin aliases', () => {
+    const result = verifyMatchTeams('спартак м - рубин', 'Rubin Kazan', 'Spartak Moscow');
+    assert.deepEqual(result, { ok: false, reason: 'teams_mismatch' });
+  });
 });
 
 test('MATCH_UNVERIFIED_ERROR is a user-facing Russian message', () => {
