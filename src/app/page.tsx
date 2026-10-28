@@ -296,7 +296,11 @@ export default function Home() {
           </div>
 
           <div className="mt-3">
+            <label htmlFor="match-date-input" className="block mb-1.5 text-xs font-mono uppercase tracking-wider text-slate-400">
+              Дата матча
+            </label>
             <input
+              id="match-date-input"
               type="date"
               value={matchDateInput}
               onChange={(e) => setMatchDateInput(e.target.value)}

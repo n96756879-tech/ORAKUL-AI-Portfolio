@@ -51,8 +51,9 @@ const CROSS_LANG_ALIAS_GROUPS: Array<string[]> = [
   ['alaves', 'алавес'],
   ['rayo vallecano', 'райо вальекано'],
   ['las palmas', 'лас пальмас'],
-  ['bayern munich', 'бавария мюнхен'],
+  ['bayern', 'bayern munich', 'bayern munchen', 'бавария', 'бавария мюнхен'],
   ['borussia dortmund', 'боруссия дортмунд'],
+  ['magdeburg', '1 magdeburg', '1 fc magdeburg', 'магдебург'],
   ['rb leipzig', 'рб лейпциг'],
   ['bayer leverkusen', 'байер леверкузен'],
   ['eintracht frankfurt', 'айнтрахт франкфурт'],
@@ -137,13 +138,36 @@ const CROSS_LANG_ALIAS_GROUPS: Array<string[]> = [
   ['rubin kazan', 'рубин казань'],
 ];
 
+// Ключи карты — имена, нормализованные той же функцией, которая применяется
+// при сравнении. Иначе RAW-вариант группы (например 'ac milan' или
+// 'bayern munich' при немецком 'Bayern München') становится мёртвым ключом:
+// он никогда не совпадает с нормализованным значением из VDP.
 function buildCanonicalMap(): Map<string, string> {
   const map = new Map<string, string>();
+  const ambiguousKeys = new Set<string>();
   for (const group of CROSS_LANG_ALIAS_GROUPS) {
-    const sorted = [...group].sort();
-    const canonical = sorted[0];
-    for (const variant of group) {
-      map.set(variant, canonical);
+    const keys = [
+      ...new Set(
+        group
+          .map((variant) => normalizeTeamForVerification(variant))
+          .filter((key) => key.length > 0),
+      ),
+    ].sort();
+    if (keys.length === 0) continue;
+    const canonical = keys[0];
+    for (const key of keys) {
+      if (ambiguousKeys.has(key)) continue;
+      const existing = map.get(key);
+      if (existing !== undefined && existing !== canonical) {
+        // Ключ встречается в разных группах: разрешение неоднозначно.
+        // Вместо выбора последней группы ключ исключается — обе стороны
+        // остаются при своих значениях и совпадут только при точном
+        // равенстве нормализованных имён.
+        ambiguousKeys.add(key);
+        map.delete(key);
+        continue;
+      }
+      map.set(key, canonical);
     }
   }
   return map;

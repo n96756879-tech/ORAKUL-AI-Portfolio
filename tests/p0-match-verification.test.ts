@@ -87,6 +87,26 @@ describe('verifyMatchTeams', () => {
     assert.deepEqual(result, { ok: true });
   });
 
+  test('passes production case: бавария vs магдебург ↔ Bayern München, 1. FC Magdeburg', () => {
+    const result = verifyMatchTeams('бавария vs магдебург', 'Bayern München', '1. FC Magdeburg');
+    assert.deepEqual(result, { ok: true });
+  });
+
+  test('passes short RU alias with umlaut VDP form: Бавария ↔ Bayern München', () => {
+    const result = verifyMatchTeams('Бавария — Боруссия Дортмунд', 'Bayern München', 'Borussia Dortmund');
+    assert.deepEqual(result, { ok: true });
+  });
+
+  test('rejects swapped order for aliases with numeric prefix', () => {
+    const result = verifyMatchTeams('бавария vs магдебург', '1. FC Magdeburg', 'Bayern München');
+    assert.deepEqual(result, { ok: false, reason: 'teams_mismatch' });
+  });
+
+  test('rejects Bayern München vs Bayer Leverkusen as teams_mismatch', () => {
+    const result = verifyMatchTeams('бавария vs магдебург', 'Bayern München', 'Bayer Leverkusen');
+    assert.deepEqual(result, { ok: false, reason: 'teams_mismatch' });
+  });
+
   test('fails when teams are genuinely different despite aliases', () => {
     const result = verifyMatchTeams('Венеция — Интер', 'Napoli', 'Juventus');
     assert.deepEqual(result, { ok: false, reason: 'teams_mismatch' });
