@@ -39,7 +39,9 @@ interface AnalysisResult {
 }
 
 export default function Home() {
-  const [matchInput, setMatchInput] = useState('');
+  const [team1Input, setTeam1Input] = useState('');
+  const [team2Input, setTeam2Input] = useState('');
+  const [matchDateInput, setMatchDateInput] = useState('');
   const [sport, setSport] = useState<'football' | 'hockey'>('football');
   const [loadingState, setLoadingState] = useState<'idle' | 'searching' | 'analyzing'>('idle');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -81,7 +83,7 @@ export default function Home() {
   const handleAnalyze = async (e: React.FormEvent) => {
     e.preventDefault();
 
-    if (!matchInput.trim()) {
+    if (!team1Input.trim() || !team2Input.trim()) {
       return;
     }
 
@@ -106,13 +108,24 @@ export default function Home() {
         ? crypto.randomUUID()
         : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
 
+    const hasTeam1 = team1Input.trim().length > 0;
+    const hasTeam2 = team2Input.trim().length > 0;
+    const payload: Record<string, unknown> = { sport, operationId };
+    if (hasTeam1 || hasTeam2) {
+      payload.team1 = team1Input.trim();
+      payload.team2 = team2Input.trim();
+    }
+    if (matchDateInput.trim()) {
+      payload.matchDate = matchDateInput.trim();
+    }
+
     try {
       const response = await fetch('/api/analyze', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ match: matchInput.trim(), sport, operationId }),
+        body: JSON.stringify(payload),
       });
 
       clearTimeout(searchTimer);
@@ -261,29 +274,49 @@ export default function Home() {
               Football
             </button>
           </div>
-          <div className="relative group">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <input
               type="text"
-              value={matchInput}
-              onChange={(e) => setMatchInput(e.target.value)}
-              placeholder={sport === 'football' ? "Россия — Португалия" : "Торонто — Монреаль"}
+              value={team1Input}
+              onChange={(e) => setTeam1Input(e.target.value)}
+              placeholder="Команда 1"
+              required
               disabled={loadingState !== 'idle'}
-              className="w-full bg-slate-900/80 backdrop-blur-xl text-slate-100 placeholder-slate-500 text-lg sm:text-xl font-medium px-6 py-5 rounded-2xl border border-slate-800 focus:border-cyan-500/80 focus:outline-none focus:ring-4 focus:ring-cyan-500/10 transition-all shadow-2xl disabled:opacity-60"
+              className="bg-slate-900/60 text-slate-100 placeholder-slate-500 px-4 py-3 rounded-xl border border-slate-800 focus:border-cyan-500/70 focus:outline-none focus:ring-2 focus:ring-cyan-500/10 transition-all disabled:opacity-60"
             />
-            
-            <button
-              type="submit"
-              disabled={loadingState !== 'idle' || !matchInput.trim()}
-              className="mt-4 w-full sm:w-auto sm:absolute sm:right-3 sm:top-3 sm:mt-0 bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-white font-semibold text-base px-8 py-3.5 rounded-xl shadow-lg shadow-cyan-500/20 transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
-            >
-              <span>✨ Анализировать {sport === 'football' ? 'матч' : 'игру'}</span>
-            </button>
+            <input
+              type="text"
+              value={team2Input}
+              onChange={(e) => setTeam2Input(e.target.value)}
+              placeholder="Команда 2"
+              required
+              disabled={loadingState !== 'idle'}
+              className="bg-slate-900/60 text-slate-100 placeholder-slate-500 px-4 py-3 rounded-xl border border-slate-800 focus:border-cyan-500/70 focus:outline-none focus:ring-2 focus:ring-cyan-500/10 transition-all disabled:opacity-60"
+            />
           </div>
+
+          <div className="mt-3">
+            <input
+              type="date"
+              value={matchDateInput}
+              onChange={(e) => setMatchDateInput(e.target.value)}
+              disabled={loadingState !== 'idle'}
+              className="w-full bg-slate-900/60 text-slate-100 placeholder-slate-500 px-4 py-3 rounded-xl border border-slate-800 focus:border-cyan-500/70 focus:outline-none focus:ring-2 focus:ring-cyan-500/10 transition-all disabled:opacity-60"
+            />
+          </div>
+
+          <button
+            type="submit"
+            disabled={loadingState !== 'idle' || !team1Input.trim() || !team2Input.trim()}
+            className="mt-4 w-full bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-white font-semibold text-base px-8 py-3.5 rounded-xl shadow-lg shadow-cyan-500/20 transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+          >
+            <span>✨ Анализировать {sport === 'football' ? 'матч' : 'игру'}</span>
+          </button>
+        </form>
 
           <p className="mt-4 text-center text-xs sm:text-sm text-slate-500">
             AI самостоятельно найдёт актуальную информацию о матче и объяснит свой прогноз.
           </p>
-        </form>
 
         {/* Value Proposition — стартовое состояние без результата */}
         {loadingState === 'idle' && !result && (
@@ -338,6 +371,12 @@ export default function Home() {
             <p className="text-xs text-slate-500 mt-2">
               Собираем информацию о текущей форме, составах и очных встречах...
             </p>
+            <p className="text-sm text-cyan-300/90 font-medium mt-4">
+              Обычно анализ занимает 1–2 минуты
+            </p>
+            <p className="text-xs text-slate-400 mt-1">
+              Пожалуйста, дождитесь завершения анализа и не закрывайте страницу.
+            </p>
           </div>
         )}
 
@@ -358,7 +397,7 @@ export default function Home() {
                 МАТЧ
               </span>
               <h2 className="text-2xl sm:text-3xl font-bold text-white">
-                {result.match?.title || matchInput}
+                {result.match?.title || `${team1Input} vs ${team2Input}`}
               </h2>
               {result.match?.meta && (
                 <p className="text-xs sm:text-sm text-slate-400 mt-1">

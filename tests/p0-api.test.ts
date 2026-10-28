@@ -484,7 +484,7 @@ describe('P0 API /api/analyze (current behavior)', () => {
       calls,
     );
 
-    const res = await postAndApplyCookies(POST, makeRequest({ match: 'Россия — Иран' }));
+    const res = await postAndApplyCookies(POST, makeRequest({ match: 'Team A vs Team B' }));
     assert.equal(res.status, 200);
     assert.equal(calls.filter((call) => call.url === 'https://api.keydealer.ru/v1/chat/completions').length, 2);
     assert.equal(calls.filter((call) => call.url.includes('api.you.com')).length, 2);
@@ -499,7 +499,7 @@ describe('P0 API /api/analyze (current behavior)', () => {
     const malformed = '{"status":"success","explanation":{"factors":["обрезано...';
     globalThis.fetch = makeMockFetch(report, [malformed, malformed], calls);
 
-    const res = await postAndApplyCookies(POST, makeRequest({ match: 'Россия — Иран' }));
+    const res = await postAndApplyCookies(POST, makeRequest({ match: 'Team A vs Team B' }));
     assert.equal(res.status, 502);
     assert.deepEqual(await res.json(), { error: 'LLM response was not valid JSON.' });
     assert.equal(calls.filter((call) => call.url === 'https://api.keydealer.ru/v1/chat/completions').length, 2);
@@ -586,8 +586,8 @@ describe('P0 API /api/analyze (current behavior)', () => {
     globalThis.fetch = makeMockFetch(report, buildLlmContractResponse({ team1: 40, draw: 27, team2: 33 }), calls);
     const sid1 = 'sid-test-1';
     const sid2 = 'sid-test-2';
-    const res1 = await postAndApplyCookies(POST, makeRequest({ match: 'Team X vs Team Y' }, sid1));
-    const res2 = await postAndApplyCookies(POST, makeRequest({ match: 'Team X vs Team Y' }, sid2));
+    const res1 = await postAndApplyCookies(POST, makeRequest({ match: 'Team A vs Team B' }, sid1));
+    const res2 = await postAndApplyCookies(POST, makeRequest({ match: 'Team A vs Team B' }, sid2));
     assert.equal(res1.status, 200);
     assert.equal(res2.status, 200);
   });
@@ -978,6 +978,55 @@ describe('P0 API /api/analyze (current behavior)', () => {
     assert.equal(releaseAttempts[0], 'test-res-t34');
   });
 
+  test('T35: new format with both teams and valid date is accepted (backwards compatible)', async () => {
+    const report = buildResearchReportWithVdp(buildFullVdp());
+    globalThis.fetch = makeMockFetch(report, buildLlmContractResponse({ team1: 45, draw: 25, team2: 30 }), calls);
+    const res = await postAndApplyCookies(POST, makeRequest({ team1: 'Team A', team2: 'Team B', matchDate: '2026-11-15' }));
+    assert.equal(res.status, 200);
+    const youCall = calls.find((c) => c.url === 'https://api.you.com/v1/research' && c.method === 'POST');
+    assert.ok(youCall?.body, 'You.com init must be called');
+    const payload = JSON.parse(youCall.body);
+    assert.match(String(payload.input), /Team A vs Team B/);
+    assert.match(String(payload.input), /2026-11-15/);
+  });
+
+  test('T36: only one of team1/team2 returns 400 without calling Research', async () => {
+    globalThis.fetch = makeMockFetch('', '', calls);
+    const res = await postAndApplyCookies(POST, makeRequest({ team1: 'Team A' }));
+    assert.equal(res.status, 400);
+    const body = await res.json();
+    assert.match(String(body.error), /обе команды/i);
+    assert.equal(calls.length, 0, 'no external calls on validation failure');
+  });
+
+  test('T37: invalid matchDate format or non-existent calendar date returns 400', async () => {
+    globalThis.fetch = makeMockFetch('', '', calls);
+    const badFormat = await postAndApplyCookies(POST, makeRequest({ team1: 'A', team2: 'B', matchDate: '15-11-2026' }));
+    assert.equal(badFormat.status, 400);
+    assert.match(String((await badFormat.json()).error), /YYYY-MM-DD/i);
+
+    const impossible = await postAndApplyCookies(POST, makeRequest({ team1: 'A', team2: 'B', matchDate: '2026-02-30' }));
+    assert.equal(impossible.status, 400);
+    assert.match(String((await impossible.json()).error), /несуществующ/i);
+    assert.equal(calls.length, 0, 'no external calls on validation failure');
+  });
+
+  test('T38: different matchDate values produce different cache keys (no cross-date reuse)', async () => {
+    const report = buildResearchReportWithVdp(buildFullVdp());
+    globalThis.fetch = makeMockFetch(report, buildLlmContractResponse({ team1: 45, draw: 25, team2: 30 }), calls);
+
+    const r1 = await postAndApplyCookies(POST, makeRequest({ team1: 'Team A', team2: 'Team B', matchDate: '2026-11-15' }));
+    assert.equal(r1.status, 200);
+    const youCallsAfterFirst = calls.filter((c) => c.url === 'https://api.you.com/v1/research' && c.method === 'POST').length;
+    assert.equal(youCallsAfterFirst, 1);
+
+    calls.length = 0;
+    const r2 = await postAndApplyCookies(POST, makeRequest({ team1: 'Team A', team2: 'Team B', matchDate: '2026-11-22' }));
+    assert.equal(r2.status, 200);
+    const youCallsAfterSecond = calls.filter((c) => c.url === 'https://api.you.com/v1/research' && c.method === 'POST').length;
+    assert.equal(youCallsAfterSecond, 1, 'different date must NOT reuse cached research');
+  });
+
   // ─────────────────────────────────────────────────────────────────────────────
   // CREDIT PAYMENT REGRESSION TESTS (execute real POST production entrypoint)
   // All use dynamic import after mocks so production route.ts + credits/session are exercised.
@@ -1170,7 +1219,7 @@ describe('P0 API /api/analyze (current behavior)', () => {
       const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
       const { POST: POSTC3 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
       globalThis.fetch = makeMockFetch(buildResearchReportWithVdp(buildFullVdp()), buildLlmContractResponse({ team1: 40, draw: 30, team2: 30 }), calls);
-      const res = await postAndApplyCookies(POSTC3, makeRequest({ match: 'X vs Y' }));
+      const res = await postAndApplyCookies(POSTC3, makeRequest({ match: 'Team A vs Team B' }));
       assert.equal(res.status, 402);
       assert.equal(calls.filter(c => c.url.includes('you.com') || c.url.includes('keydealer')).length, 0);
     });
@@ -1193,7 +1242,7 @@ describe('P0 API /api/analyze (current behavior)', () => {
       const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
       const { POST: POSTC4 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
       globalThis.fetch = makeMockFetch(buildResearchReportWithVdp(buildFullVdp()), buildLlmContractResponse({ team1: 45, draw: 25, team2: 30 }), calls);
-      const res = await postAndApplyCookies(POSTC4, makeRequest({ match: 'A vs B' }));
+      const res = await postAndApplyCookies(POSTC4, makeRequest({ match: 'Team A vs Team B' }));
       assert.equal(res.status, 200);
       assert.equal(reserveCalls.length, 1);
       assert.equal(reserveCalls[0].amount, 10);
@@ -1224,11 +1273,11 @@ describe('P0 API /api/analyze (current behavior)', () => {
       const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
       const { POST: POSTC5 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
       globalThis.fetch = makeMockFetch(buildResearchReportWithVdp(buildFullVdp()), buildLlmContractResponse({ team1: 40, draw: 20, team2: 40 }), calls);
-      const res = await postAndApplyCookies(POSTC5, makeRequest({ match: 'Exact vs Cost' }));
+      const res = await postAndApplyCookies(POSTC5, makeRequest({ match: 'Team A vs Team B' }));
       assert.equal(res.status, 200);
       assert.equal(currentBalance, 0);
       // second attempt must now fail
-      const res2 = await postAndApplyCookies(POSTC5, makeRequest({ match: 'Exact vs Cost 2' }));
+      const res2 = await postAndApplyCookies(POSTC5, makeRequest({ match: 'Team A vs Team B' }));
       assert.equal(res2.status, 402);
       assert.equal(currentBalance, 0);
     });
@@ -1256,8 +1305,8 @@ describe('P0 API /api/analyze (current behavior)', () => {
       const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
       const { POST: POSTC6 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
       globalThis.fetch = makeMockFetch(buildResearchReportWithVdp(buildFullVdp()), buildLlmContractResponse({ team1: 33, draw: 33, team2: 34 }), calls);
-      const r1 = await postAndApplyCookies(POSTC6, makeRequest({ match: 'One vs Two' }));
-      const r2 = await postAndApplyCookies(POSTC6, makeRequest({ match: 'Three vs Four' }));
+      const r1 = await postAndApplyCookies(POSTC6, makeRequest({ match: 'Team A vs Team B' }));
+      const r2 = await postAndApplyCookies(POSTC6, makeRequest({ match: 'Team A vs Team B' }));
       assert.equal(r1.status, 200);
       assert.equal(r2.status, 402); // second should fail, balance now 5 < 10
       assert.ok(currentBalance >= 0);
@@ -1292,7 +1341,7 @@ describe('P0 API /api/analyze (current behavior)', () => {
       const { POST: POSTC7 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
       globalThis.fetch = makeMockFetch(buildResearchReportWithVdp(buildFullVdp()), buildLlmContractResponse({ team1: 60, draw: 10, team2: 30 }), calls);
       // first
-      const r1 = await postAndApplyCookies(POSTC7, makeRequest({ match: 'Idem Match' }));
+      const r1 = await postAndApplyCookies(POSTC7, makeRequest({ match: 'Team A vs Team B' }));
       assert.equal(r1.status, 200);
       // simulate repeat with same key by direct (in real the key is generated inside route per request; here we trust the mock detects dup on same input)
       // To exercise the path we call reserve directly via the mocked function
@@ -1326,7 +1375,7 @@ describe('P0 API /api/analyze (current behavior)', () => {
       const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
       const { POST: POSTC8 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
       globalThis.fetch = makeMockFetch(buildResearchReportWithVdp(buildFullVdp()), buildLlmContractResponse({ team1: 50, draw: 25, team2: 25 }), calls);
-      const r = await postAndApplyCookies(POSTC8, makeRequest({ match: 'Conf Match' }));
+      const r = await postAndApplyCookies(POSTC8, makeRequest({ match: 'Team A vs Team B' }));
       assert.equal(r.status, 200);
       // direct conflict simulation
       const { reserveCreditSpend } = await import('@/lib/supabase/credits');
@@ -1360,7 +1409,7 @@ describe('P0 API /api/analyze (current behavior)', () => {
         calls,
         500,
       );
-      const res = await postAndApplyCookies(POSTC9, makeRequest({ match: 'Err Match' }));
+      const res = await postAndApplyCookies(POSTC9, makeRequest({ match: 'Team A vs Team B' }));
       assert.equal(res.status, 502);
       assert.equal(released.length, 1);
     });
@@ -1407,7 +1456,7 @@ describe('P0 API /api/analyze (current behavior)', () => {
       const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
       const { POST: POSTC10 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
       globalThis.fetch = makeMockFetch(buildResearchReportWithVdp(buildFullVdp()), buildLlmContractResponse({ team1: 40, draw: 20, team2: 40 }), calls);
-      const res = await postAndApplyCookies(POSTC10, makeRequest({ match: 'ConsumeFail vs Match' }));
+      const res = await postAndApplyCookies(POSTC10, makeRequest({ match: 'Team A vs Team B' }));
       assert.equal(res.status, 500);
       const body = await res.json();
       assert.ok(String(body.error || '').toLowerCase().includes('accounting') || String(body.error || '').includes('credit'));
@@ -1486,7 +1535,7 @@ describe('P0 API /api/analyze (current behavior)', () => {
       const bust = Date.now().toString(36) + Math.random().toString(36).slice(2);
       const { POST: POSTC13 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
       globalThis.fetch = makeMockFetch(buildResearchReportWithVdp(buildFullVdp()), buildLlmContractResponse({ team1: 50, draw: 25, team2: 25 }), calls);
-      const res = await postAndApplyCookies(POSTC13, makeRequest({ match: 'Srv vs Price', userId: 'hacker', price: 1, cost: 1 }));
+      const res = await postAndApplyCookies(POSTC13, makeRequest({ match: 'Team A vs Team B', userId: 'hacker', price: 1, cost: 1 }));
       assert.equal(res.status, 200);
       assert.equal(seenUser, 'u-server'); // not the hacker value
       assert.equal(reserveCalls[0].amount, 10); // from env, not client
@@ -1515,8 +1564,8 @@ describe('P0 API /api/analyze (current behavior)', () => {
       const { POST: POSTC14 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
       globalThis.fetch = makeMockFetch(buildResearchReportWithVdp(buildFullVdp()), buildLlmContractResponse({ team1: 40, draw: 30, team2: 30 }), calls);
 
-      const r1 = await postAndApplyCookies(POSTC14, makeRequest({ match: 'Same Match', operationId: 'op-aaaaaaaa-1' }));
-      const r2 = await postAndApplyCookies(POSTC14, makeRequest({ match: 'Same Match', operationId: 'op-bbbbbbbb-2' }));
+      const r1 = await postAndApplyCookies(POSTC14, makeRequest({ match: 'Team A vs Team B', operationId: 'op-aaaaaaaa-1' }));
+      const r2 = await postAndApplyCookies(POSTC14, makeRequest({ match: 'Team A vs Team B', operationId: 'op-bbbbbbbb-2' }));
 
       assert.equal(r1.status, 200);
       assert.equal(r2.status, 200);
@@ -1550,8 +1599,8 @@ describe('P0 API /api/analyze (current behavior)', () => {
       const { POST: POSTC15 } = await import(`../src/app/api/analyze/route?cb=${bust}`);
       globalThis.fetch = makeMockFetch(buildResearchReportWithVdp(buildFullVdp()), buildLlmContractResponse({ team1: 40, draw: 30, team2: 30 }), calls);
 
-      const r1 = await postAndApplyCookies(POSTC15, makeRequest({ match: 'Retry Match', operationId: 'op-same-request-1' }));
-      const r2 = await postAndApplyCookies(POSTC15, makeRequest({ match: 'Retry Match', operationId: 'op-same-request-1' }));
+      const r1 = await postAndApplyCookies(POSTC15, makeRequest({ match: 'Team A vs Team B', operationId: 'op-same-request-1' }));
+      const r2 = await postAndApplyCookies(POSTC15, makeRequest({ match: 'Team A vs Team B', operationId: 'op-same-request-1' }));
 
       assert.equal(r1.status, 200);
       assert.equal(r2.status, 200);

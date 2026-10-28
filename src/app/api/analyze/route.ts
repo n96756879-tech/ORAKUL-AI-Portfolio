@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import { parseHockeyVDP } from '@/lib/hockey/hockey-vdp-parser';
+import { verifyMatchTeams, MATCH_UNVERIFIED_ERROR } from '@/lib/match-verification';
 import { adaptHockeyVDPToEngineInput } from '@/lib/hockey/hockey-engine-adapter';
 import { predictHockeyMatch } from '@/lib/hockey/hockey-engine';
 import { parseVDP } from '@/lib/vdp-parser';
@@ -484,7 +485,7 @@ function adaptAnalysisContractToResponse(
   researchSources: ResearchSource[],
   goalDistribution: GoalDistributionResult,
 ) {
-  const matchTitle = contract.match || trimmedMatch;
+  const matchTitle = trimmedMatch;
   const probabilities = contract.probabilities;
   const explanation = contract.explanation;
 
@@ -797,6 +798,27 @@ async function handleHockeyAnalysis(
     }
 
   const parsedHockeyVdp = parseHockeyVDP(rawVdpText);
+
+  // Guard: расчёт допускается только если команды из VDP соответствуют
+  // запрошенному пользователем матчу. Отклонённый матч не списывает кредиты.
+  const hockeyVerification = verifyMatchTeams(
+    trimmedMatch,
+    parsedHockeyVdp.match.team1Name,
+    parsedHockeyVdp.match.team2Name,
+  );
+  if (!hockeyVerification.ok) {
+    console.error(`[ORAKUL HOCKEY] Match verification failed (${hockeyVerification.reason}). Aborting before probability calculation.`);
+    if (freeGenReservationId) {
+      await releaseFreeGeneration(freeGenReservationId);
+      freeGenReservationId = null;
+    }
+    if (creditSpendReservationId) {
+      await releaseCreditSpend(createServiceRoleClient(), creditSpendReservationId, creditSpendIdemKey);
+      creditSpendReservationId = null;
+    }
+    return NextResponse.json({ error: MATCH_UNVERIFIED_ERROR }, { status: 422 });
+  }
+
   const engineInput = adaptHockeyVDPToEngineInput(parsedHockeyVdp);
   const predictionResult = predictHockeyMatch(engineInput);
 
@@ -881,7 +903,8 @@ ${truncatedReport}`;
     }
   }
 
-  // Fallback text if LLM failed
+  // Fallback text if LLM failed. Probabilities remain engine-computed and are
+  // only reachable here when the match-verification guard already passed.
   if (!contract) {
     contract = {
       match: trimmedMatch,
@@ -927,7 +950,7 @@ ${truncatedReport}`;
   const responseBody: AnalysisResult = {
     status: 'success',
     match: {
-      title: contract.match || trimmedMatch,
+      title: trimmedMatch,
       meta: 'Анализ на основе исследования открытых источников',
     },
     probabilities: {
@@ -995,13 +1018,65 @@ async function getOrCreateAnonSessionId(): Promise<string> {
 
 export async function POST(req: Request) {
   try {
-    const { match, sport = 'football', operationId } = await req.json();
+    const body = await req.json();
+    const matchRaw = body?.match;
+    const team1Raw = body?.team1;
+    const team2Raw = body?.team2;
+    const matchDateRaw = body?.matchDate;
+    const sportRaw = body?.sport ?? 'football';
+    const operationId = body?.operationId;
+    const sport = typeof sportRaw === 'string' ? sportRaw : 'football';
 
-    if (!match || typeof match !== 'string' || match.trim().length === 0) {
+    const hasTeam1 = typeof team1Raw === 'string' && team1Raw.trim().length > 0;
+    const hasTeam2 = typeof team2Raw === 'string' && team2Raw.trim().length > 0;
+    if (hasTeam1 !== hasTeam2) {
+      return NextResponse.json(
+        { error: 'Укажите обе команды или используйте старый формат с полем match.' },
+        { status: 400 }
+      );
+    }
+
+    let trimmedMatch: string;
+    if (hasTeam1 && hasTeam2) {
+      trimmedMatch = `${team1Raw.trim()} vs ${team2Raw.trim()}`;
+    } else if (typeof matchRaw === 'string' && matchRaw.trim().length > 0) {
+      trimmedMatch = matchRaw.trim();
+    } else {
       return NextResponse.json(
         { error: 'Не указан матч для анализа. Введите название матча.' },
         { status: 400 }
       );
+    }
+
+    let matchDate: string | null = null;
+    if (matchDateRaw !== undefined && matchDateRaw !== null) {
+      if (typeof matchDateRaw !== 'string') {
+        return NextResponse.json(
+          { error: 'Дата матча должна быть строкой в формате YYYY-MM-DD.' },
+          { status: 400 }
+        );
+      }
+      const dateStr = matchDateRaw.trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+        return NextResponse.json(
+          { error: 'Дата матча должна быть в формате YYYY-MM-DD.' },
+          { status: 400 }
+        );
+      }
+      const [y, m, d] = dateStr.split('-').map(Number);
+      const dt = new Date(Date.UTC(y, m - 1, d));
+      if (
+        Number.isNaN(dt.getTime()) ||
+        dt.getUTCFullYear() !== y ||
+        dt.getUTCMonth() !== m - 1 ||
+        dt.getUTCDate() !== d
+      ) {
+        return NextResponse.json(
+          { error: 'Указана несуществующая календарная дата.' },
+          { status: 400 }
+        );
+      }
+      matchDate = dateStr;
     }
 
     // Client-supplied operation identifier: identifies a single logical analysis
@@ -1015,7 +1090,6 @@ export async function POST(req: Request) {
       );
     }
 
-    const trimmedMatch = match.trim();
     const ydcApiKey = process.env.YDC_API_KEY;
     const keydealerApiKey = process.env.KEYDEALER_API_KEY;
 
@@ -1122,7 +1196,7 @@ export async function POST(req: Request) {
       return await handleHockeyAnalysis(trimmedMatch, ydcApiKey, keydealerApiKey, freeGenReservationId, creditSpendReservationId, creditSpendIdemKey);
     }
 
-    const researchQuery = matchQueryFromFreeForm(trimmedMatch);
+    const researchQuery = { ...matchQueryFromFreeForm(trimmedMatch), date: matchDate };
     const researchCacheKey = buildResearchCacheKey(researchQuery);
 
     // ── DAL (STEP 9/10): опциональный контекст данных, полностью bypass по умолчанию.
@@ -1151,7 +1225,8 @@ export async function POST(req: Request) {
     }
 
     // 1. Формирование исследовательского вопроса
-    const researchQuestion = `Проведи глубокое независимое спортивно-статистическое исследование матча "${trimmedMatch}" (актуальный контекст: ${currentDateStr}).
+    const matchDateClause = matchDate ? ` Запрошенная дата матча: ${matchDate}.` : '';
+    const researchQuestion = `Проведи глубокое независимое спортивно-статистическое исследование матча "${trimmedMatch}" (актуальный контекст: ${currentDateStr}).${matchDateClause}
 
 Ты создаёшь внутренний проверенный пакет данных (VERIFIED DATA PACK) для следующего этапа LLM-анализа. Отдавай приоритет официальным источникам. Каждый существенный факт должен иметь подтверждение из надёжного источника.
 
@@ -1874,6 +1949,26 @@ K. Финальный JSON соответствует существующему
       team2Matches: parsedVDP.team2.matches.length,
       h2hCount: parsedVDP.h2h.length,
     }));
+
+    // Guard: расчёт допускается только если команды из VDP соответствуют
+    // запрошенному пользователем матчу. Отклонённый матч не списывает кредиты.
+    const matchVerification = verifyMatchTeams(
+      trimmedMatch,
+      parsedVDP.team1.teamName,
+      parsedVDP.team2.teamName,
+    );
+    if (!matchVerification.ok) {
+      console.error(`[ORAKUL] Match verification failed (${matchVerification.reason}). Aborting before probability calculation.`);
+      if (freeGenReservationId) {
+        await releaseFreeGeneration(freeGenReservationId);
+        freeGenReservationId = null;
+      }
+      if (creditSpendReservationId) {
+        await releaseCreditSpend(createServiceRoleClient(), creditSpendReservationId, creditSpendIdemKey);
+        creditSpendReservationId = null;
+      }
+      return NextResponse.json({ error: MATCH_UNVERIFIED_ERROR }, { status: 422 });
+    }
 
     const hasSufficientVDP =
       !!parsedVDP.team1.teamName &&
