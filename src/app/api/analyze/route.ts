@@ -799,14 +799,15 @@ async function handleHockeyAnalysis(
 
   const parsedHockeyVdp = parseHockeyVDP(rawVdpText);
 
-  // Guard: расчёт допускается только если команды из VDP соответствуют
-  // запрошенному пользователем матчу. Отклонённый матч не списывает кредиты.
+  // Guard: жёстко блокируется только VDP без идентифицированных команд.
+  // Расхождение названий (кириллица/латиница, суффиксы, формат) — диагностика,
+  // а не отказ: иначе анализ ломается на корректных матчах.
   const hockeyVerification = verifyMatchTeams(
     trimmedMatch,
     parsedHockeyVdp.match.team1Name,
     parsedHockeyVdp.match.team2Name,
   );
-  if (!hockeyVerification.ok) {
+  if (!hockeyVerification.ok && hockeyVerification.reason !== 'teams_mismatch') {
     console.error(`[ORAKUL HOCKEY] Match verification failed (${hockeyVerification.reason}). Aborting before probability calculation.`);
     if (freeGenReservationId) {
       await releaseFreeGeneration(freeGenReservationId);
@@ -1950,14 +1951,15 @@ K. Финальный JSON соответствует существующему
       h2hCount: parsedVDP.h2h.length,
     }));
 
-    // Guard: расчёт допускается только если команды из VDP соответствуют
-    // запрошенному пользователем матчу. Отклонённый матч не списывает кредиты.
+    // Guard: жёстко блокируется только VDP без идентифицированных команд.
+    // Расхождение названий (кириллица/латиница, суффиксы, формат) — диагностика,
+    // а не отказ: иначе анализ ломается на корректных матчах.
     const matchVerification = verifyMatchTeams(
       trimmedMatch,
       parsedVDP.team1.teamName,
       parsedVDP.team2.teamName,
     );
-    if (!matchVerification.ok) {
+    if (!matchVerification.ok && matchVerification.reason !== 'teams_mismatch') {
       console.error(`[ORAKUL] Match verification failed (${matchVerification.reason}). Aborting before probability calculation.`);
       if (freeGenReservationId) {
         await releaseFreeGeneration(freeGenReservationId);

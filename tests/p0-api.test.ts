@@ -13,6 +13,8 @@ import {
   buildFullVdp,
   buildResearchReportWithVdp,
   buildLlmContractResponse,
+  TEAM1_MATCHES,
+  TEAM2_MATCHES,
 } from './helpers/fixtures';
 import { clearResearchCacheForTests } from '../src/lib/data/research-cache';
 
@@ -309,6 +311,59 @@ describe('P0 API /api/analyze (current behavior)', () => {
     }
     assert.ok(body.explanation, 'response must contain explanation');
     assert.ok(Array.isArray(body.usedSources), 'response must contain usedSources array');
+  });
+
+  test('T12a: RU team names in request with EN names in VDP are not blocked — 200', async () => {
+    // Регрессия: ранее такие запросы падали с 422 «Матч не подтверждён».
+    const report = buildResearchReportWithVdp(buildFullVdp());
+    globalThis.fetch = makeMockFetch(
+      report,
+      buildLlmContractResponse({ team1: 45, draw: 25, team2: 30 }),
+      calls
+    );
+
+    for (const match of [
+      'Эвертон — Ньюкасл Юнайтед',
+      'Фиорентина — Аталанта',
+      'Крылья Советов — Динамо Махачкала',
+    ]) {
+      clearResearchCacheForTests();
+      calls = [];
+      const res = await postAndApplyCookies(POST, makeRequest({ match }));
+      const body = await res.json();
+      assert.equal(
+        res.status,
+        200,
+        `${match}: expected analysis to proceed, got ${res.status} ${JSON.stringify(body)}`
+      );
+      assert.ok(Array.isArray(body.probabilities?.outcomes));
+    }
+  });
+
+  test('T12b: VDP without identifiable teams still fails as a real data error — 422', async () => {
+    // Блокировка по названиям снята, но отсутствие команд в VDP остаётся ошибкой.
+    const vdpWithoutTeamNames = `## MATCH
+
+- **FACT:** undefined
+
+## TEAM 1 FORM
+
+${TEAM1_MATCHES.join('\n\n')}
+
+## TEAM 2 FORM
+
+${TEAM2_MATCHES.join('\n\n')}
+`;
+    globalThis.fetch = makeMockFetch(
+      buildResearchReportWithVdp(vdpWithoutTeamNames),
+      buildLlmContractResponse({ team1: 45, draw: 25, team2: 30 }),
+      calls
+    );
+
+    const res = await postAndApplyCookies(POST, makeRequest({ match: 'Эвертон — Ньюкасл Юнайтед' }));
+    assert.equal(res.status, 422);
+    const body = await res.json();
+    assert.ok(String(body.error).length > 0);
   });
 
   test('T13: production route calls Goal Distribution and keeps A1 response authoritative', async () => {
